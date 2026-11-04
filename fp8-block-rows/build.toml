@@ -1,0 +1,27 @@
+[general]
+name = "fp8-block-rows"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+edition = 6
+
+[general.hub]
+repo-id = "crit-labs/fp8-block-rows"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.fp8_block]
+language = "cpp-cuda"
+depends = ["torch"]
+cuda-capabilities = ["8.9", "9.0", "10.0", "12.0"]
+src = [
+  "fp8_block_cuda/binding.cu",
+  "fp8_block_cuda/fp8_block.cu",
+  "fp8_block_cuda/fp8_block.h",
+]
