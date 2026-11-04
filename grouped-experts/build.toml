@@ -1,0 +1,26 @@
+[general]
+name = "grouped-experts"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+edition = 6
+
+[general.hub]
+repo-id = "crit-labs/grouped-experts"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.grouped_experts]
+language = "cpp-cuda"
+depends = ["torch"]
+src = [
+  "grouped_experts_cuda/binding.cu",
+  "grouped_experts_cuda/grouped_experts.cu",
+  "grouped_experts_cuda/grouped_experts.h",
+]
