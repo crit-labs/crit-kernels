@@ -1,0 +1,26 @@
+[general]
+name = "recurrent-scans"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+edition = 6
+
+[general.hub]
+repo-id = "crit-labs/recurrent-scans"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.recurrent_scans]
+language = "cpp-cuda"
+depends = ["torch"]
+src = [
+  "recurrent_scans_cuda/binding.cu",
+  "recurrent_scans_cuda/recurrent_kernels.cu",
+  "recurrent_scans_cuda/recurrent_kernels.h",
+]
