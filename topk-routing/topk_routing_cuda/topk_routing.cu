@@ -3,12 +3,22 @@
 // registers, so a row costs one read of its logits and one write of its picks.
 #include "topk_routing.h"
 
+#include <climits>
 #include <math_constants.h>
 
 namespace crit::techniques::topk_routing {
 namespace {
 
 constexpr int kWarps = 4;
+constexpr int kNanKey = INT_MIN + 1, kPastKey = INT_MIN;
+
+// A selection value as an int of the same order (-0 and +0 equal); NaN below every number, -inf included, and the
+// lanes past the experts below NaN.
+__device__ __forceinline__ int order_key(float c) {
+    if(isnan(c)) return kNanKey;
+    const int i = c == 0.0f ? 0 : __float_as_int(c);
+    return i < 0 ? i ^ 0x7fffffff : i;
+}
 
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
@@ -29,7 +39,8 @@ __global__ void __launch_bounds__(kWarps * 32) route_kernel(const float* __restr
     const int row = blockIdx.x * kWarps + static_cast<int>(threadIdx.x) / 32, lane = threadIdx.x & 31;
     if(row >= tokens) return;
     const float* l = logits + static_cast<long long>(row) * ld;
-    float x[PER], score[PER], choice[PER];
+    float x[PER], score[PER];
+    int choice[PER];
 #pragma unroll
     for(int i = 0; i < PER; ++i) {
         const int e = lane + 32 * i;
@@ -59,15 +70,14 @@ __global__ void __launch_bounds__(kWarps * 32) route_kernel(const float* __restr
 #pragma unroll
     for(int i = 0; i < PER; ++i) {
         const int e = lane + 32 * i;
-        float c = score[i] + (bias && e < experts ? bias[e] : 0.0f);
-        choice[i] = (e < experts && !isnan(c)) ? c : -CUDART_INF_F;
+        const float c = score[i] + (bias && e < experts ? bias[e] : 0.0f);
+        choice[i] = e < experts ? order_key(c) : kPastKey;
     }
     unsigned taken = 0;
     int picked = -1;          // lane k keeps pick k
     float picked_value = 0.0f, picked_logit = 0.0f;
     for(int k = 0; k < top; ++k) {
-        float best = -CUDART_INF_F;
-        int at = 0x7fffffff;
+        int best = INT_MIN, at = 0x7fffffff;
 #pragma unroll
         for(int i = 0; i < PER; ++i) {
             const int e = lane + 32 * i;
@@ -80,7 +90,7 @@ __global__ void __launch_bounds__(kWarps * 32) route_kernel(const float* __restr
         }
 #pragma unroll
         for(int o = 16; o > 0; o >>= 1) {
-            const float ob = __shfl_xor_sync(0xffffffffu, best, o);
+            const int ob = __shfl_xor_sync(0xffffffffu, best, o);
             const int oa = __shfl_xor_sync(0xffffffffu, at, o);
             if(ob > best || (ob == best && oa < at)) {
                 best = ob;

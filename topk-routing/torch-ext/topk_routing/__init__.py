@@ -1,7 +1,8 @@
 """Top-k expert routing of router logits in one kernel, a warp per token row (crit's topk-router plugin loads this from
 the kernel registry): softmax or sigmoid scores before or after selection, a correction bias that only changes the
-selection, renormalization and scaling; ties to the lower expert id; NaN logits rank below every number, so a row of
-NaN logits still picks valid distinct experts, with weights 0. One launch, no host synchronization.
+selection, renormalization and scaling; ties to the lower expert id; NaN logits rank below every number (-inf
+included), so a row of NaN logits still picks valid distinct experts, with weights 0. One launch, no host
+synchronization.
 
     ids, weights = route(logits, top, bias=None, softmax=True, before=False, renormalize=False)
 """

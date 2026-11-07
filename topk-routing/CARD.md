@@ -9,9 +9,9 @@ dispatch's `routing.py`). Softmax or sigmoid scores before or after the selectio
 only changes the selection, renormalization (divide by max(sum + epsilon, floor)) and scaling.
 
 - **Canonical ties**: the larger value, then the lower expert id.
-- **NaN-safe**: a NaN ranks below every number, so a row of NaN logits (a captured decode round's junk positions)
-  still picks valid distinct experts (the lowest ids) and gets weights 0; a NaN poisons a softmax over its row as it
-  does in torch.
+- **NaN-safe**: a NaN ranks below every number, -inf included, so a row of NaN logits (a captured decode round's junk
+  positions) still picks valid distinct experts (the lowest ids) and gets weights 0; a NaN poisons a softmax over its
+  row as it does in torch.
 - **One launch, no host synchronization**: a call at a fixed token count is captured in a CUDA graph.
 
 Group limits (groups, selected_groups, group_score_top) are the plugin's torch path.

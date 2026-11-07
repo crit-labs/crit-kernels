@@ -1,6 +1,6 @@
 """The fused top-k routing against an FP64 reference of the same rule: the same ids (ties to the lower id), weights
-within FP32 rounding, rows of NaN logits routed to the lowest ids with weights 0 and other rows untouched, and a
-captured call replaying new logits."""
+within FP32 rounding, rows of NaN logits routed to the lowest ids with weights 0 (NaN below a real -inf) and other rows
+untouched, and a captured call replaying new logits."""
 import math
 
 import pytest
@@ -69,6 +69,17 @@ def test_ties_go_to_the_lower_id_and_nan_rows_still_route():
     ids, weights = tr.route(logits, 3, None, softmax=True, before=True, renormalize=True)
     assert ids[2].tolist() == [0, 1, 2] and ids[3].tolist() == [0, 1, 2]   # a NaN poisons a softmax over the row
     assert not bool(torch.isnan(weights).any())
+
+
+@pytest.mark.kernels_ci
+def test_nan_ranks_below_a_real_negative_infinity():
+    inf, nan = float("inf"), float("nan")
+    logits = torch.tensor([[nan, -inf, 1.0, nan, -inf, nan, nan, nan], [-0.0, 0.0, nan, -inf, -1.0, nan, nan, nan]],
+                          device=dev)
+    ids, weights = tr.route(logits, 4, None, softmax=False, before=False)
+    assert ids[0].tolist() == [2, 1, 4, 0]   # 1, then the two -inf ahead of every NaN
+    assert ids[1].tolist() == [0, 1, 4, 3]   # -0 and +0 tie: the lower id first
+    assert weights[0].tolist()[1:3] == [0.0, 0.0] and weights[0, 3].item() == 0.0
 
 
 @pytest.mark.kernels_ci
