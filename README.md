@@ -3,8 +3,11 @@
 Source for the CUDA kernels that [crit](https://github.com/crit-labs/crit) publishes to the
 [Hugging Face Kernel Hub](https://huggingface.co/kernels). Each folder is one
 [kernel-builder](https://github.com/huggingface/kernel-builder) project (`build.toml`, `flake.nix`, CUDA source,
-tests and an applicability card, `CARD.md`) and becomes its own Hub repository, `crit-labs/<folder>`. crit's
-techniques name them as `hub:crit-labs/<folder>` in their `kernels.json`.
+tests and an applicability card, `CARD.md`) and becomes its own Hub repository, `crit-labs/<folder>`. A crit plugin
+that loads one declares it in its `plugin.json` `kernels` with its pin (`{"name": "crit-labs/<folder>", "version": 1,
+"revision": null until published, "fallback": ...}`) and loads it through `crit_plugins.kernels.registry_kernel`; crit's
+techniques keep no lists of kernels, only each operation's contract (`operations.json`: what it computes, the
+reference, how a kernel is verified against it).
 
 | Kernel | Hub repository | From crit's technique |
 | --- | --- | --- |
