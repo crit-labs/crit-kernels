@@ -1,4 +1,4 @@
-"""The pool kernels (pool_delta, pool_delta_replay, pool_conv, conv_segments) against a float64 recurrence:
+"""The pool kernels (pool_delta, pool_delta_replay, pool_conv, conv_segments, pool_conv_prompt) against a float64 recurrence:
 rows of many sequences in one launch, each from its own state; a row's bits independent of the rows beside it; the three
 commit strategies bit for bit the same as decoding the accepted tokens one by one, for every accepted count; and
 capture in a CUDA graph."""
@@ -377,3 +377,69 @@ def test_a_convolution_into_its_own_input_is_refused():
     x = torch.randn(4, 8, device=dev)
     with pytest.raises(RuntimeError, match="out must not be x"):
         rs.conv_segments(x, torch.zeros(8, 3, device=dev), torch.zeros(8, 3, device=dev), x, torch.zeros(8, 4, device=dev))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("width", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_padded_prompt_chunk_convolves_its_real_rows_and_moves_the_window_past_them(width, dtype):
+    """pool_conv_prompt over a bucket of 64 rows has the bits of a pending flush then conv_segments over the chunk's
+    real rows alone, outputs zeros for the padding, and writes the window after the real inputs in place; a sequence
+    below 0 touches nothing. Captured once, it replays for any count."""
+    g = torch.Generator(device="cpu").manual_seed(40 + width)
+    C, cap, bucket = 300, 4, 64
+    x = torch.randn(bucket, C, generator=g).to(dev).to(dtype)
+    weight, bias = torch.randn(C, width, generator=g).to(dev), torch.randn(C, generator=g).to(dev)
+    window = torch.randn(1, 3, C, width - 1, generator=g).to(dev)
+    stash = torch.randn(1, 3, cap, C, generator=g).to(dev)
+    pending = torch.zeros(1, 3, rs.pool_conv_blocks(C), dtype=torch.int32, device=dev)
+    meta = torch.zeros(1, 5, dtype=torch.int32, device=dev)
+    out = torch.full_like(x, float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    rs.pool_conv_prompt(out, window, stash, pending, x, weight, bias, meta=meta, capacity=cap)   # warm-up: count 0
+    with torch.cuda.graph(graph):
+        rs.pool_conv_prompt(out, window, stash, pending, x, weight, bias, meta=meta, capacity=cap)
+    for count, waiting in ((0, 2), (1, 0), (2, 3), (width - 1, 1), (23, 0), (64, 2)):
+        pending.fill_(waiting)
+        expected_window, expected_pending = window.clone(), pending.clone()
+        flush = torch.tensor([[0, 0, 1, rs.FLUSH, -1]], dtype=torch.int32, device=dev)
+        rs.pool_conv(out[:0], expected_window, stash, expected_pending, None, x[:0], weight, bias, meta=flush, rows=1,
+                     capacity=cap)
+        expected = torch.zeros_like(x)
+        after = expected_window[0, 1].clone()
+        if count:
+            rs.conv_segments(expected[:count], expected_window[0, 1].clone(), after, x[:count], weight, bias)
+        meta.copy_(torch.tensor([[0, count, 1, rs.FINAL, 1]], dtype=torch.int32))
+        graph.replay()
+        assert torch.equal(out, expected), count
+        assert torch.equal(window[0, 1], after), count
+        assert torch.equal(pending[0, 1], torch.zeros_like(pending[0, 1]))
+        assert torch.equal(pending[0, 0], expected_pending[0, 0])
+        assert torch.equal(window[0, 0], expected_window[0, 0]) and torch.equal(window[0, 2], expected_window[0, 2])
+    before, waiting = window.clone(), pending.clone()
+    meta.copy_(torch.tensor([[0, 0, -1, rs.FINAL, -1]], dtype=torch.int32))
+    graph.replay()
+    assert torch.equal(out, torch.zeros_like(out)) and torch.equal(window, before) and torch.equal(pending, waiting)
+
+
+@pytest.mark.kernels_ci
+def test_a_final_row_into_its_own_live_state_continues_it():
+    """A FINAL row whose scratch slot is its sequence's live state (a captured prompt chunk's pool_delta): the pending
+    count applied, the row's tokens scanned, the live state left as decoding them one by one would."""
+    kh, vh, dk, dv = 2, 4, 64, 64
+    q, k, v, g, b = inputs(9, kh, vh, dk, dv, seed=29)
+    whole, serial = Pool(1, 3, kh, vh, dk, dv, capacity=2), Pool(1, 3, kh, vh, dk, dv, capacity=2)
+    for pool in (whole, serial):   # a decode row of two tokens, committed (deferred)
+        pool.rows(0, q[:2], k[:2], v[:2], g[:2], b[:2], [(0, 2, 1, rs.STASH, -1)], 0.25)
+        pool.record([2], [1])
+    live = whole.states[0].view(whole.states.shape[1], -1)
+    out = whole.rows(0, q[2:], k[2:], v[2:], g[2:], b[2:], [(0, 7, 1, rs.FINAL, 1)], 0.25, scratch=live)
+    steps = []
+    for t in range(2, 9):   # the same tokens decoded one by one, each committed
+        steps.append(serial.rows(0, q[t:t + 1], k[t:t + 1], v[t:t + 1], g[t:t + 1], b[t:t + 1], [(0, 1, 1, rs.STASH, -1)],
+                                 0.25))
+        serial.record([1], [1])
+    serial.flush([1])
+    assert torch.equal(out, torch.cat(steps))
+    assert torch.equal(whole.states[0, 1], serial.states[0, 1])
+    assert torch.equal(whole.states[0, 0], serial.states[0, 0]) and torch.equal(whole.states[0, 2], serial.states[0, 2])

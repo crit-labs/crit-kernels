@@ -265,6 +265,39 @@ void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, 
     check_ok(rk::enqueue_pool_conv(c, p, s, static_cast<int>(layers), at::cuda::getCurrentCUDAStream()), "pool_conv");
 }
 
+void pool_conv_prompt(torch::Tensor& out, torch::Tensor& window, const torch::Tensor& stash, torch::Tensor& pending,
+                      const torch::Tensor& x, const torch::Tensor& weight, const std::optional<torch::Tensor>& bias,
+                      const torch::Tensor& meta, int64_t layer, int64_t capacity, bool silu) {
+    const c10::cuda::CUDAGuard guard(window.device());
+    rk::ConvInputs c = conv_inputs(out, x, weight, bias, silu);
+    check_contiguous(window, "window", torch::kFloat32, 4);
+    check_contiguous(stash, "stash", torch::kFloat32, 4);
+    check_contiguous(pending, "pending", torch::kInt32, 3);
+    TORCH_CHECK(window.size(2) == c.channels && window.size(3) == c.width - 1, "window must be [layers][sequences][channels][width - 1]");
+    TORCH_CHECK(stash.size(0) == window.size(0) && stash.size(2) == capacity && stash.size(3) == c.channels,
+                "stash must be [layers][sequences][capacity][channels]");
+    TORCH_CHECK(pending.size(0) == window.size(0) && pending.size(2) == rk::pool_conv_blocks(c.channels),
+                "pending must be [layers][sequences][pool_conv_blocks]");
+    TORCH_CHECK(layer >= 0 && layer < window.size(0), "layer out of range");
+    TORCH_CHECK(meta.is_cuda() && meta.scalar_type() == torch::kInt32 && meta.is_contiguous() && meta.numel() >= 5,
+                "meta must be a contiguous int32 row [5] on the device");
+    TORCH_CHECK(out.size(0) == x.size(0), "out must have x's rows");
+    rk::PoolConv p;
+    p.window = window.data_ptr<float>() + layer * window.stride(0);
+    p.window_sequence = window.stride(1);
+    p.window_layer = window.stride(0);
+    p.stash = stash.data_ptr<float>() + layer * stash.stride(0);
+    p.stash_sequence = stash.stride(1);
+    p.stash_layer = stash.stride(0);
+    p.capacity = static_cast<int>(capacity);
+    p.pending = pending.data_ptr<std::int32_t>() + layer * pending.stride(0);
+    p.pending_sequence = pending.stride(1);
+    p.pending_layer = pending.stride(0);
+    check_ok(rk::enqueue_pool_conv_prompt(c, p, meta.data_ptr<std::int32_t>(), static_cast<int>(x.size(0)),
+                                          at::cuda::getCurrentCUDAStream()),
+             "pool_conv_prompt");
+}
+
 void conv_segments(torch::Tensor& out, const torch::Tensor& window_in, torch::Tensor& window_out, const torch::Tensor& x,
                    const torch::Tensor& weight, const std::optional<torch::Tensor>& bias, bool silu) {
     const c10::cuda::CUDAGuard guard(x.device());

@@ -51,3 +51,7 @@ void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, 
                int64_t capacity, bool silu);
 void conv_segments(torch::Tensor& out, const torch::Tensor& window_in, torch::Tensor& window_out, const torch::Tensor& x,
                    const torch::Tensor& weight, const std::optional<torch::Tensor>& bias, bool silu);
+// A captured prompt chunk's convolution: its count and sequence from meta [5] on the device (recurrent_rows.h).
+void pool_conv_prompt(torch::Tensor& out, torch::Tensor& window, const torch::Tensor& stash, torch::Tensor& pending,
+                      const torch::Tensor& x, const torch::Tensor& weight, const std::optional<torch::Tensor>& bias,
+                      const torch::Tensor& meta, int64_t layer, int64_t capacity, bool silu);

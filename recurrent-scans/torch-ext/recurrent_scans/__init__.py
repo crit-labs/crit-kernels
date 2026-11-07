@@ -12,7 +12,7 @@ from ._ops import ops
 __all__ = ["causal_conv1d", "gated_delta_prefill", "gated_delta_scan", "ssd_prefill", "ssd_scan",
            "STASH", "CHECKPOINTS", "RECOMPUTE", "FINAL", "FLUSH", "REPLAY", "FLUSH_PENDING",
            "pool_blocks", "pool_half_floats", "pool_conv_blocks", "pool_delta", "pool_delta_replay", "pool_conv",
-           "conv_segments"]
+           "conv_segments", "pool_conv_prompt"]
 
 
 def causal_conv1d(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor, bias: Optional[torch.Tensor] = None,
@@ -133,4 +133,14 @@ def conv_segments(out, window_in, window_out, x, weight, bias=None, silu=True):
     """One long row out of place from window_in ([channels][width - 1]), the window after its last input to
     window_out: a thread per channel and 32 rows, the bits of pool_conv's."""
     ops.conv_segments(out, window_in, window_out, x, weight, bias, silu)
+    return out
+
+
+def pool_conv_prompt(out, window, stash, pending, x, weight, bias=None, meta=None, layer=0, capacity=1, silu=True):
+    """One sequence's prompt chunk padded to x's rows (a captured graph's bucket): meta [5] int32 on the device (first,
+    count, sequence, kind, slot; count and sequence read) says how many rows are real and whose window they continue.
+    The real rows convolve from window[layer][sequence] after its pending count (applied and consumed), the padding
+    rows output zeros, and the window after the real inputs is written in place; a sequence below 0 outputs zeros and
+    touches no window. The bits of pool_conv's and conv_segments'. Capture-safe: the same launch for any chunk."""
+    ops.pool_conv_prompt(out, window, stash, pending, x, weight, bias, meta, layer, capacity, silu)
     return out

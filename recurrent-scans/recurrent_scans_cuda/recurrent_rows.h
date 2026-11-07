@@ -127,6 +127,12 @@ int pool_conv_blocks(int channels);
 // inputs), kFinal (convolve, the window after the last input into the scratch) or kFlush, over `layers` layers (a block
 // walks them). out must not be x.
 cudaError_t enqueue_pool_conv(const ConvInputs&, const PoolConv&, const RowSource&, int layers, cudaStream_t);
+// One sequence's prompt chunk padded to `rows` tokens (a captured graph's bucket), its count and sequence read from
+// meta [5] (first, count, sequence, kind, slot; first, kind and slot unused) on the device: the first count rows
+// convolve from the sequence's window after its pending count (applied and consumed), the rest output zeros, and the
+// window after the count real inputs is written in place; a sequence below 0 outputs zeros and touches no window. The
+// pool's pointers at the layer. The bits of the row kernel. out must not overlap x.
+cudaError_t enqueue_pool_conv_prompt(const ConvInputs&, const PoolConv&, const std::int32_t* meta, int rows, cudaStream_t);
 // One long row (a prompt chunk) out of place from window_in, writing window_out: a thread per (channel, 32 rows), the
 // same bits as the row kernel. out must not overlap x.
 cudaError_t enqueue_conv_segments(const ConvInputs&, const float* window_in, float* window_out, int rows, cudaStream_t);

@@ -22,6 +22,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "int layer, int layers, int capacity, bool silu) -> ()");
   ops.def("conv_segments(Tensor! out, Tensor window_in, Tensor! window_out, Tensor x, Tensor weight, Tensor? bias, "
           "bool silu) -> ()");
+  ops.def("pool_conv_prompt(Tensor! out, Tensor! window, Tensor stash, Tensor! pending, Tensor x, Tensor weight, "
+          "Tensor? bias, Tensor meta, int layer, int capacity, bool silu) -> ()");
 #if defined(CUDA_KERNEL)
   ops.impl("causal_conv1d", torch::kCUDA, &causal_conv1d);
   ops.impl("gated_delta_prefill", torch::kCUDA, &gated_delta_prefill);
@@ -32,6 +34,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("pool_delta_replay", torch::kCUDA, &pool_delta_replay);
   ops.impl("pool_conv", torch::kCUDA, &pool_conv);
   ops.impl("conv_segments", torch::kCUDA, &conv_segments);
+  ops.impl("pool_conv_prompt", torch::kCUDA, &pool_conv_prompt);
 #endif
 }
 

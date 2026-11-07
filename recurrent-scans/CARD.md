@@ -18,8 +18,11 @@ CUDA kernels for the recurrent layers of hybrid language models, from [crit](htt
   every token (per-column checkpoints), keeps its start state (a recompute commit, `pool_delta_replay`), or keeps its
   final state (a prompt row). Rows come from a table the host writes or from a captured round's device tensors and a
   slot table, so a round is captured once. `pool_conv` / `conv_segments`: the causal convolution over pooled windows,
-  deferred the same way, and long rows split into 32-row segments with the same bits. The commit's bookkeeping (writing
-  the accepted count, selecting a checkpoint) is the caller's.
+  deferred the same way, and long rows split into 32-row segments with the same bits. `pool_conv_prompt`: one
+  sequence's prompt chunk padded to a captured graph's bucket, its sequence and real length read on the device, the
+  padding output as zeros and the window moved past the real inputs only (with `pool_delta`'s FINAL row written into
+  the live state, a chunk replays for any sequence and length). The commit's bookkeeping (writing the accepted count,
+  selecting a checkpoint) is the caller's.
 
 The scans are column invariant (a token decoded alone equals the same token inside a multi-token verify, bit for bit)
 and can write the state after every token (`checkpoints`), which speculative decoding needs to roll back rejected
