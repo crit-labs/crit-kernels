@@ -7,7 +7,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("rows(Tensor table, Tensor jobs, int max_rows, Tensor values, Tensor scales, int block, Tensor! out) -> ()");
   ops.def("gemm(Tensor table, Tensor jobs, int max_rows, int max_count, Tensor values, Tensor scales, int block, "
           "Tensor! out) -> ()");
-  ops.def("quantize_e2m1x2(Tensor x, float global, Tensor! values, Tensor! scales) -> ()");
+  ops.def("quantize_e2m1x2(Tensor x, float global_scale, Tensor! values, Tensor! scales) -> ()");
   ops.def("quantize_int8(Tensor x, int block, Tensor! values, Tensor! scales) -> ()");
   ops.def("swiglu(Tensor gate_up, Tensor! out) -> ()");
 #if defined(CUDA_KERNEL)
