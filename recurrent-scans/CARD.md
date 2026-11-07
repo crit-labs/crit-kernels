@@ -30,7 +30,12 @@ decode. Everything is FP32; the state is updated in place. Key dims 64 or 128, v
 d_state 64 or 128, head_dim a multiple of 32).
 
 Measured on one RTX 5090: the gated-delta prefill of a 2,048-token chunk at Qwen3.8-27B's shape (16 key and 48 value
-heads, dk = dv = 128) takes 1.38 ms per layer. The tests compare every function with a float64 recurrence.
+heads, dk = dv = 128) takes 1.38 ms per layer (1.32 ms measured again 2026-11-07, 5.2 ms per 8,192 tokens). At the same
+shape the pool rows take 5.4 us per layer for one sequence's decode token, 12.0 us for an 8-column verify row and
+56.4 us for 8 sequences x 8 columns (deferred commit; a 48-layer round of convolution, scan and commit captured as one
+CUDA graph: 0.51, 1.06 and 4.28 ms); per-column checkpoints cost up to 2.5x that, the recompute commit up to 1.7x. The
+tests compare every function with a float64 recurrence; tests/cuda holds the reference scans of the commit strategies
+and their CUDA fixture against crit's FP64 host oracle (cmake -S tests/cuda -DCRIT_ROOT=<a crit checkout>).
 
 ## How to use
 {% if functions %}
