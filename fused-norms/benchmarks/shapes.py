@@ -82,6 +82,12 @@ def calls(model, rows):
     if flashinfer is not None:
         rb, wb = r.to(BF16), (w + m["offset"]).to(BF16)
         out["residual + rms_norm"]["flashinfer (bf16 residual)"] = lambda: flashinfer.norm.fused_add_rmsnorm(a, rb, wb, EPS)
+    w16 = (w + m["offset"]).to(BF16) if m["offset"] else w.to(BF16)
+    out["rms_norm, BF16 weight"] = {
+        "chain": lambda: chain_norm(a, w16.float(), 0.0),
+        "fused": lambda: fn.rms_norm(a, w16, EPS)}
+    if flashinfer is not None:
+        out["rms_norm, BF16 weight"]["flashinfer"] = lambda: flashinfer.norm.rmsnorm(a, w16, EPS)
     if m["qk_norm"]:
         out["q, k: head norm + rope"] = {
             "chain": lambda: (chain_rope(chain_norm(q, qw, m["offset"]), positions, inv, m["rotary"]),

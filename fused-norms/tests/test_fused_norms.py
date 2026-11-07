@@ -226,6 +226,52 @@ def test_a_row_has_its_bits_alone_and_beside_others(width, heads, dim, rotary):
 
 
 @pytest.mark.kernels_ci
+def test_unaligned_layouts_keep_a_rows_bits_too():
+    # A width no multiple of 16 (BF16 in, FP32 out) and a head view whose token stride is odd: their launches must not
+    # depend on the row count either (a 1-row call specializes like a 64-row call).
+    g = gen(41)
+    f32 = torch.float32
+    x, r = normal(g, 64, 4100, scale=2, dtype=torch.bfloat16), normal(g, 64, 4100)
+    w, z = normal(g, 4100) * 0.1 + 1, normal(g, 64, 4100, dtype=torch.bfloat16)
+    big = normal(g, 64, 8 * 128 + 1, dtype=torch.bfloat16)
+    q = big[:, :1024].view(64, 8, 128)
+    hw = normal(g, 128) * 0.1 + 1
+    positions = torch.randint(0, 4096, (64,), generator=g).to(dev)
+    freqs = inv_freq(128, 1e4)
+    calls = {"rms_norm": lambda k: fn.rms_norm(x[:k], w, 1e-6, out_dtype=f32),
+             "l2_norm": lambda k: fn.l2_norm(x[:k], out_dtype=f32),
+             "gated": lambda k: fn.gated_rms_norm(x[:k], z[:k], w, 1e-6, out_dtype=f32),
+             "residual": lambda k: torch.cat(fn.rms_norm(x[:k], w, 1e-6, residual=r[:k].clone(), out_dtype=f32), -1),
+             "heads view": lambda k: fn.rms_norm_heads(q[:k], hw, 1e-6, out_dtype=f32),
+             "rope view": lambda k: fn.rms_norm_rope(q[:k], hw, 1e-6, positions[:k], freqs, out_dtype=f32),
+             "l2 view": lambda k: fn.l2_norm(q[:k], out_dtype=f32)}
+    for name, call in calls.items():
+        whole = call(64)
+        for k in (1, 2, 3, 8):
+            assert torch.equal(call(k), whole[:k]), f"{name}: a {k}-row call differs from the same rows of 64"
+    assert torch.equal(calls["heads view"](64), fn.rms_norm_heads(q.contiguous(), hw, 1e-6, out_dtype=f32))
+    close(fn.rms_norm(x, w, 1e-6, out_dtype=f32), ref_rms(x, w, 1e-6))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype,shape", [(torch.float32, (2048, 32, 256)), (torch.bfloat16, (2048, 4, 4096)),
+                                         (torch.float32, (4096, 8, 1024))])
+def test_rope_in_place_equals_rope_out_of_place(dtype, shape):
+    g = gen(17)
+    x = normal(g, *shape, dtype=dtype)
+    positions = torch.randint(0, 100000, (shape[0],), generator=g).to(dev)
+    freqs = inv_freq(shape[-1], 1e4)
+    w = normal(g, shape[-1]) * 0.1 + 1
+    for call in (lambda t, out=None: fn.rope(t, positions, freqs, out=out),
+                 lambda t, out=None: fn.rms_norm_rope(t, w, 1e-6, positions, freqs, out=out)):
+        expected = call(x)
+        for _ in range(10):
+            again = x.clone()
+            call(again, out=again)
+            assert torch.equal(again, expected)
+
+
+@pytest.mark.kernels_ci
 def test_views_give_the_bits_of_their_copies():
     g = gen(3)
     qg = normal(g, 6, 4, 128, dtype=torch.bfloat16)
@@ -269,7 +315,11 @@ def test_out_in_place_and_dtypes():
     assert tuple(fn.silu_mul(x, layout="interleaved").shape) == (3, 2, 32)
     for bad in (lambda: fn.rms_norm(x, normal(g, 32), 1e-6), lambda: fn.silu_mul(x.view(3, 128)[:, :127]),
                 lambda: fn.rope(x, positions[:2], freqs), lambda: fn.rope(x, positions, inv_freq(80, 1e4)),
-                lambda: fn.gated_rms_norm(x, x[:2], w, 1e-6), lambda: fn.rms_norm(x.cpu(), None, 1e-6)):
+                lambda: fn.gated_rms_norm(x, x[:2], w, 1e-6), lambda: fn.rms_norm(x.cpu(), None, 1e-6),
+                lambda: fn.rms_norm(x.view(6, 64), w, 1e-6, out=torch.empty(64, 6, dtype=x.dtype, device=dev).t()),
+                lambda: fn.silu_mul(x.view(3, 128), out=torch.empty(64, 3, dtype=x.dtype, device=dev).t()),
+                lambda: fn.rms_norm_rope(normal(g, 4, 64), normal(g, 4, 64), 1e-6, positions[:3].repeat(2)[:4],
+                                         freqs)):
         with pytest.raises(ValueError):
             bad()
 

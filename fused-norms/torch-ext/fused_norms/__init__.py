@@ -9,10 +9,14 @@ added into every stream with a weight per stream.
 Inputs BF16, FP16 or FP32 on a CUDA device, each read in its own dtype; FP32 inside; one rounding, to out_dtype (by
 default the dtype of the tensor normalized or gated). The last dimension is contiguous and the others may have any
 strides (views of a fused projection's output). Each row's bits are independent of the rows beside it and of the row
-count, so decode rows, verify windows and prompt rows agree. Nothing synchronizes with the host and nothing is
-allocated but the result (written to `out` when given), so CUDA graphs capture every call once its shape has been
-compiled (call each shape once before capturing it).
+count, so decode rows, verify windows and prompt rows agree: a launch's specialization never depends on the row count
+(dimensions of size 1 keep their strides), and a layout the kernels cannot read aligned (a base address or a row stride
+that is not a multiple of 16) is copied into aligned buffers first, so every row is read by one layout. Nothing
+synchronizes with the host and every allocation (the result unless `out` is given, and those copies) comes from
+torch's caching allocator, so CUDA graphs capture every call once its shape has been compiled (call each shape once
+before capturing it). Every tensor of a call is on one device, the one the call runs on.
 """
+import contextlib
 from typing import Optional
 
 import torch
@@ -50,20 +54,44 @@ def _config(width):
     return found
 
 
-def _check(x, what="x"):
+def _check(x, what="x", device=None):
     if not x.is_cuda or x.dtype not in FLOATS:
         raise ValueError(f"{what} is a BF16, FP16 or FP32 CUDA tensor, not {x.dtype} on {x.device}")
+    if device is not None and x.device != device:
+        raise ValueError(f"{what} is on {x.device}, the call's tensors on {device}")
     if x.dim() < 1 or x.shape[-1] < 1 or (x.stride(-1) != 1 and x.shape[-1] > 1):
         raise ValueError(f"{what}'s last dimension is contiguous")
 
 
+def _on(x):
+    """The launch context: x's device when it is not the current one."""
+    if x.device.index == torch.cuda.current_device():
+        return contextlib.nullcontext()
+    return torch.cuda.device(x.device)
+
+
+def _aligned(tensors, strides):
+    """Whether the kernels read every tensor aligned: 16-byte base addresses and row strides that are multiples of 16
+    (a launch's specialization then never depends on the rows given)."""
+    return (all(t.data_ptr() % 16 == 0 for t in tensors)
+            and all(a % 16 == 0 and b % 16 == 0 for a, b in strides))
+
+
+def _padded(t, copy=True):
+    """t's values in an aligned buffer whose rows are padded to a multiple of 16 values (a view of t's shape)."""
+    width = t.shape[-1]
+    buffer = torch.empty((*t.shape[:-1], _cdiv(width, 16) * 16), dtype=t.dtype, device=t.device)[..., :width]
+    if copy:
+        buffer.copy_(t)
+    return buffer
+
+
 def _collapse(shape, tensors):
     """(A, B, [(sa, sb)]) such that row a * B + b of every tensor sits at a * sa + b * sb, from shape[:-1] and each
-    tensor's strides, or None when the leading dimensions do not merge into two levels for every tensor."""
+    tensor's strides, or None when the leading dimensions do not merge into two levels for every tensor. Dimensions of
+    size 1 count with their strides like any other, so a call of one row merges the way a call of many does."""
     dims = []
     for i, size in enumerate(shape[:-1]):
-        if size == 1:
-            continue
         strides = [t.stride(i) for t in tensors]
         if dims and all(outer == size * inner for outer, inner in zip(dims[-1][1], strides)):
             dims[-1] = (dims[-1][0] * size, strides)
@@ -86,7 +114,10 @@ def _result(x, shape, out_dtype, out):
     if out is None:
         return torch.empty(shape, dtype=out_dtype, device=x.device)
     if tuple(out.shape) != tuple(shape) or out.dtype != out_dtype or out.device != x.device:
-        raise ValueError(f"out is {tuple(out.shape)} {out.dtype}; the result is {tuple(shape)} {out_dtype}")
+        raise ValueError(f"out is {tuple(out.shape)} {out.dtype} on {out.device}; the result is {tuple(shape)} "
+                         f"{out_dtype} on {x.device}")
+    if shape[-1] > 1 and out.stride(-1) != 1:
+        raise ValueError("out's last dimension is contiguous")
     return out
 
 
@@ -96,9 +127,9 @@ def _weight(weight, x):
     width = x.shape[-1]
     if weight is None:
         return 1, 0, False
-    if not weight.is_cuda or weight.shape[-1] != width or weight.stride(-1) != 1:
+    if weight.device != x.device or weight.shape[-1] != width or weight.stride(-1) != 1:
         raise ValueError(f"a weight of shape {tuple(weight.shape)} for rows of {width} (its last dimension contiguous, "
-                         "on the device)")
+                         f"on {x.device})")
     if weight.dim() == 1:
         return 1, 0, False
     if weight.dim() != 2 or x.dim() < 2 or x.shape[-2] != weight.shape[0]:
@@ -114,17 +145,20 @@ def _rows(x, weight, eps, offset, norm, residual=None, z=None, gate=0, out_dtype
     groups, swg, grouped = _weight(weight, x)
     for other, what in ((residual, "residual"), (z, "z")):
         if other is not None:
-            _check(other, what)
+            _check(other, what, x.device)
             if other.shape != x.shape:
                 raise ValueError(f"{what} of shape {tuple(other.shape)} for x of shape {tuple(x.shape)}")
     y = _result(residual if residual is not None else x, x.shape, out_dtype, out)
-    layout = _collapse(x.shape, [t for t in (x, residual, z, y) if t is not None])
-    if layout is None:   # leading dimensions no two levels cover: contiguous copies, then the results copied back
-        kept = None if residual is None else residual.contiguous()
-        found = torch.empty(x.shape, dtype=y.dtype, device=x.device)
-        _rows(x.contiguous(), weight, eps, offset, norm, kept, None if z is None else z.contiguous(), gate, y.dtype,
-              found)
-        if kept is not None and kept is not residual:
+    present = [t for t in (x, residual, z, y) if t is not None]
+    layout = _collapse(x.shape, present)
+    if layout is None or not _aligned(present + ([weight] if weight is not None else []), layout[2]):
+        # a layout the kernels cannot read aligned in two levels: aligned padded copies, the results copied back
+        kept = None if residual is None else _padded(residual)
+        found = _padded(y, copy=False)
+        if weight is not None and weight.data_ptr() % 16:
+            weight = weight.clone()
+        _rows(_padded(x), weight, eps, offset, norm, kept, None if z is None else _padded(z), gate, y.dtype, found)
+        if kept is not None:
             residual.copy_(kept)
         y.copy_(found)
         return y
@@ -141,15 +175,16 @@ def _rows(x, weight, eps, offset, norm, residual=None, z=None, gate=0, out_dtype
     w = weight if weight is not None else x
     r = residual if residual is not None else x
     g = z if z is not None else x
-    if block <= WIDEST_BLOCK:
-        _triton.rows_kernel[(_cdiv(n_rows, rows),)](
-            x, *sx, r, *sr, g, *sz, w, groups, swg, y, *sy, x, x, 0, 1, n_rows, B, 1, width, 0, float(eps),
-            float(offset), 1.0, NORM=norm, HAS_RES=residual is not None, HAS_W=weight is not None, GROUPED=grouped,
-            GATE=gate, ROPE=0, TABLE=False, HB=rows, BD=block, num_warps=warps)
-    else:
-        _triton.long_rows_kernel[(n_rows,)](
-            x, *sx, r, *sr, g, *sz, w, groups, swg, y, *sy, B, width, float(eps), float(offset),
-            NORM=norm, HAS_RES=residual is not None, HAS_W=weight is not None, GATE=gate, CHUNK=CHUNK, num_warps=8)
+    with _on(x):
+        if block <= WIDEST_BLOCK:
+            _triton.rows_kernel[(_cdiv(n_rows, rows),)](
+                x, *sx, r, *sr, g, *sz, w, groups, swg, y, *sy, x, x, 0, 1, n_rows, B, 1, width, 0, float(eps),
+                float(offset), 1.0, NORM=norm, HAS_RES=residual is not None, HAS_W=weight is not None,
+                GROUPED=grouped, GATE=gate, ROPE=0, TABLE=False, IN_PLACE=False, HB=rows, BD=block, num_warps=warps)
+        else:
+            _triton.long_rows_kernel[(n_rows,)](
+                x, *sx, r, *sr, g, *sz, w, groups, swg, y, *sy, B, width, float(eps), float(offset),
+                NORM=norm, HAS_RES=residual is not None, HAS_W=weight is not None, GATE=gate, CHUNK=CHUNK, num_warps=8)
     return y
 
 
@@ -166,7 +201,7 @@ def rms_norm(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float, offset
 
 def rms_norm_heads(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float, offset: float = 0.0,
                    out_dtype: Optional[torch.dtype] = None, out: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """rms_norm of each head of x [tokens][heads][dim] (query and key norms), weight [dim]."""
+    """rms_norm of each head of x [tokens][heads][dim] (query and key norms), weight [dim] or [heads][dim]."""
     return _rows(x, weight, eps, offset, 1, out_dtype=out_dtype, out=out)
 
 
@@ -185,9 +220,9 @@ def l2_norm(x: torch.Tensor, eps: float = 1e-6, out_dtype: Optional[torch.dtype]
     return _rows(x, None, eps, 0.0, 2, out_dtype=out_dtype, out=out)
 
 
-def _rotary(freqs, rotary_dim, width):
-    if not freqs.is_cuda or freqs.dtype != torch.float32 or freqs.stride(-1) != 1:
-        raise ValueError("freqs is a contiguous FP32 CUDA tensor")
+def _rotary(freqs, rotary_dim, width, device):
+    if freqs.device != device or freqs.dtype != torch.float32 or freqs.stride(-1) != 1:
+        raise ValueError(f"freqs is a contiguous FP32 tensor on {device}")
     if freqs.dim() == 1:
         found = 2 * freqs.shape[0]
     elif freqs.dim() == 2:
@@ -209,30 +244,40 @@ def _rope(x, positions, freqs, rotary_dim, style, scale, weight, eps, offset, no
         raise ValueError(f"style is one of {', '.join(STYLES)}, not {style!r}")
     tokens, width = x.shape[0], x.shape[-1]
     heads = x.shape[1] if x.dim() == 3 else 1
-    if positions.shape != (tokens,) or not positions.is_cuda or positions.dtype not in (torch.int64, torch.int32):
-        raise ValueError(f"positions [tokens] int64 or int32 on the device, not {tuple(positions.shape)} "
-                         f"{positions.dtype}")
-    groups, swg, grouped = _weight(weight, x)
-    rotary_dim = _rotary(freqs, rotary_dim, width)
+    if (positions.shape != (tokens,) or positions.device != x.device
+            or positions.dtype not in (torch.int64, torch.int32)):
+        raise ValueError(f"positions [tokens] int64 or int32 on {x.device}, not {tuple(positions.shape)} "
+                         f"{positions.dtype} on {positions.device}")
+    groups, swg, grouped = _weight(weight, x if x.dim() == 3 else x[:, None, :])
+    rotary_dim = _rotary(freqs, rotary_dim, width, x.device)
     block, rows, warps = _config(width)
     if block > WIDEST_BLOCK:
         raise ValueError(f"heads of {width} values are wider than rope's {WIDEST_BLOCK}")
     rows = min(rows, 1 << (heads - 1).bit_length())
     warps = max(1, min(16, block * rows // 512))
     y = _result(x, x.shape, out_dtype, out)
-    if tokens == 0:
+    if tokens == 0 or heads == 0:
         return y
     positions = positions.contiguous()
     sx = (x.stride(0), x.stride(1) if x.dim() == 3 else 0)
     sy = (y.stride(0), y.stride(1) if y.dim() == 3 else 0)
+    if not _aligned([x, y] + ([weight] if weight is not None else []), [sx, sy]):
+        # a layout the kernel cannot read aligned: an aligned padded copy, the result copied back (in place too)
+        found = _padded(y, copy=False)
+        if weight is not None and weight.data_ptr() % 16:
+            weight = weight.clone()
+        _rope(_padded(x), positions, freqs, rotary_dim, style, scale, weight, eps, offset, norm, y.dtype, found)
+        y.copy_(found)
+        return y
     n_blocks = _cdiv(heads, rows)
     table = freqs.dim() == 2
-    _triton.rows_kernel[(tokens * n_blocks,)](
-        x, *sx, x, 0, 0, x, 0, 0, weight if weight is not None else x, groups, swg, y, *sy,
-        positions, freqs, freqs.stride(0) if table else 0, freqs.shape[0] if table else 1, tokens * heads, heads,
-        n_blocks, width, rotary_dim, float(eps), float(offset), float(scale),
-        NORM=norm, HAS_RES=False, HAS_W=weight is not None, GROUPED=grouped, GATE=0, ROPE=STYLES[style], TABLE=table,
-        HB=rows, BD=block, num_warps=warps)
+    with _on(x):
+        _triton.rows_kernel[(tokens * n_blocks,)](
+            x, *sx, x, 0, 0, x, 0, 0, weight if weight is not None else x, groups, swg, y, *sy,
+            positions, freqs, freqs.stride(0) if table else 0, freqs.shape[0] if table else 1, tokens * heads, heads,
+            n_blocks, width, rotary_dim, float(eps), float(offset), float(scale),
+            NORM=norm, HAS_RES=False, HAS_W=weight is not None, GROUPED=grouped, GATE=0, ROPE=STYLES[style],
+            TABLE=table, IN_PLACE=y.data_ptr() == x.data_ptr(), HB=rows, BD=block, num_warps=warps)
     return y
 
 
@@ -259,7 +304,7 @@ def _product(gate, up, activation, out_dtype, out, interleaved=False, source=Non
     """y = activation(gate) * up over every last-dimension row; interleaved: both alternate in `source`."""
     _check(gate if source is None else source)
     if up is not None:
-        _check(up, "up")
+        _check(up, "up", (gate if source is None else source).device)
     width = gate.shape[-1]
     y = _result(source if source is not None else gate, gate.shape, out_dtype, out)
     present = [source] if interleaved else [gate, up]
@@ -284,9 +329,10 @@ def _product(gate, up, activation, out_dtype, out, interleaved=False, source=Non
     sy = strides[-1]
     n_blocks = _cdiv(width, PRODUCT_BLOCK)
     first = source if interleaved else gate
-    _triton.act_mul_kernel[(n_rows * n_blocks,)](
-        first, *sg, first if interleaved else up, *su, y, *sy, n_rows, B, width, n_blocks,
-        ACT=activation, INTERLEAVED=interleaved, BLOCK=PRODUCT_BLOCK, num_warps=4)
+    with _on(first):
+        _triton.act_mul_kernel[(n_rows * n_blocks,)](
+            first, *sg, first if interleaved else up, *su, y, *sy, n_rows, B, width, n_blocks,
+            ACT=activation, INTERLEAVED=interleaved, BLOCK=PRODUCT_BLOCK, num_warps=4)
     return y
 
 
@@ -341,14 +387,14 @@ def stream_sum(x: torch.Tensor, gate: Optional[torch.Tensor] = None, activation:
     """y[t] = scale * the sum over streams s, in stream order, of activation(gate[t][s]) * x[t][s]: x [tokens][streams]
     [dim]; gate x's shape (one gate per value) or [tokens][streams] (one per stream), or None for the plain sum
     (scale 1 / streams: their mean); activation none (the gate itself), silu, gelu, gelu_tanh or sigmoid. y
-    [tokens][dim]."""
+    [tokens][dim]. A per-token mix of S streams into S streams is S calls, each into its output stream's out= view."""
     _streams(x, "x")
     tokens, streams, width = x.shape
     if activation not in STREAM_GATES:
         raise ValueError(f"activation is one of {', '.join(STREAM_GATES)}, not {activation!r}")
     if gate is not None:
-        if not gate.is_cuda or gate.dtype not in FLOATS or tuple(gate.shape) not in ((tokens, streams, width),
-                                                                                    (tokens, streams)):
+        if gate.device != x.device or gate.dtype not in FLOATS or tuple(gate.shape) not in ((tokens, streams, width),
+                                                                                          (tokens, streams)):
             raise ValueError(f"a gate of shape {tuple(gate.shape)} for streams of shape {tuple(x.shape)}: one per "
                              "value or one per stream")
         per_value = gate.dim() == 3
@@ -358,14 +404,14 @@ def stream_sum(x: torch.Tensor, gate: Optional[torch.Tensor] = None, activation:
     else:
         sg = (0, 0, 0)
     y = _result(x, (tokens, width), out_dtype, out)
-    if y.stride(-1) != 1 and width > 1:
-        raise ValueError("out's last dimension is contiguous")
     if tokens == 0 or streams == 0:
         return y.zero_()
     n_blocks = _cdiv(width, PRODUCT_BLOCK)
-    _triton.stream_sum_kernel[(tokens * n_blocks,)](
-        x, x.stride(0), x.stride(1), gate if gate is not None else x, *sg, y, y.stride(0), streams, width, n_blocks,
-        float(scale), HAS_GATE=gate is not None, ACT=STREAM_GATES[activation], BLOCK=PRODUCT_BLOCK, num_warps=4)
+    with _on(x):
+        _triton.stream_sum_kernel[(tokens * n_blocks,)](
+            x, x.stride(0), x.stride(1), gate if gate is not None else x, *sg, y, y.stride(0), streams, width,
+            n_blocks, float(scale), HAS_GATE=gate is not None, ACT=STREAM_GATES[activation], BLOCK=PRODUCT_BLOCK,
+            num_warps=4)
     return y
 
 
@@ -373,17 +419,19 @@ def stream_add(streams: torch.Tensor, x: torch.Tensor, weights: Optional[torch.T
     """streams[t][s] += weights[t][s] * x[t] for every stream s, in place (weights [tokens][streams], or None for 1):
     one row added into every residual stream; streams [tokens][streams][dim] in their own dtype, x [tokens][dim]."""
     _streams(streams, "streams")
-    _check(x)
+    _check(x, "x", streams.device)
     tokens, count, width = streams.shape
     if tuple(x.shape) != (tokens, width):
         raise ValueError(f"x of shape {tuple(x.shape)} for streams of shape {tuple(streams.shape)}")
-    if weights is not None and (not weights.is_cuda or tuple(weights.shape) != (tokens, count)):
-        raise ValueError(f"weights of shape {tuple(weights.shape)}: one per token and stream")
+    if weights is not None and (weights.device != streams.device or tuple(weights.shape) != (tokens, count)):
+        raise ValueError(f"weights of shape {tuple(weights.shape)} on {weights.device}: one per token and stream, on "
+                         f"{streams.device}")
     if tokens == 0:
         return streams
     n_blocks = _cdiv(width, PRODUCT_BLOCK)
     sw = (weights.stride(0), weights.stride(1)) if weights is not None else (0, 0)
-    _triton.stream_add_kernel[(tokens * n_blocks,)](
-        streams, streams.stride(0), streams.stride(1), x, x.stride(0), weights if weights is not None else x, *sw,
-        count, width, n_blocks, HAS_W=weights is not None, BLOCK=PRODUCT_BLOCK, num_warps=4)
+    with _on(streams):
+        _triton.stream_add_kernel[(tokens * n_blocks,)](
+            streams, streams.stride(0), streams.stride(1), x, x.stride(0), weights if weights is not None else x,
+            *sw, count, width, n_blocks, HAS_W=weights is not None, BLOCK=PRODUCT_BLOCK, num_warps=4)
     return streams

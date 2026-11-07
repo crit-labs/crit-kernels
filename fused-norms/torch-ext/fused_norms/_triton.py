@@ -38,10 +38,12 @@ def _activation(g, ACT: tl.constexpr):
 def rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups, swg, y_ptr, sya, syb,
                 pos_ptr, f_ptr, sf, n_table, n_rows, B, n_blocks, D, R, eps, offset, scale,
                 NORM: tl.constexpr, HAS_RES: tl.constexpr, HAS_W: tl.constexpr, GROUPED: tl.constexpr,
-                GATE: tl.constexpr, ROPE: tl.constexpr, TABLE: tl.constexpr, HB: tl.constexpr, BD: tl.constexpr):
+                GATE: tl.constexpr, ROPE: tl.constexpr, TABLE: tl.constexpr, IN_PLACE: tl.constexpr,
+                HB: tl.constexpr, BD: tl.constexpr):
     """Rows of D values at x[a * sxa + b * sxb + d]: without rope, rows r = a * B + b of n_rows, HB consecutive rows a
     program; with rope, a program is token a's heads b of one block of HB (n_blocks blocks a token). GROUPED: the
-    weight has one row (swg apart) per group, row r (head b with rope) taking row r % groups (b % groups)."""
+    weight has one row (swg apart) per group, row r (head b with rope) taking row r % groups (b % groups). IN_PLACE
+    (rope writing into x): every thread's loads, its partners' included, finish before any store."""
     pid = tl.program_id(0)
     if ROPE != 0:
         a = (pid // n_blocks).to(tl.int64)
@@ -124,6 +126,8 @@ def rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups
         else:
             y = y * _sigmoid(g)
     y_rows = a_rows * sya + b * syb
+    if IN_PLACE:
+        tl.debug_barrier()
     tl.store(y_ptr + y_rows[:, None] + d[None, :], y.to(y_ptr.dtype.element_ty), mask=m)
 
 
