@@ -21,7 +21,7 @@ invariance in the engine's facts.
 | Operands | `x [M][K]`, `dense [N][K]`, both BF16 or both FP16, unit column stride; any `M`, `N`, `K` |
 | Output | `[M][N]` in x's dtype or the one asked for (FP32 for logits) |
 | GPUs | NVIDIA with Triton's tensor-core `tl.dot` (sm_80 and newer) |
-| Tiles | 128 x 128 x 64 (8 warps, 3 stages), or 64 x 64 x 64 (4 warps, 4 stages) where the large tile would not fill the device twice over; the tile picks which outputs a program computes, never an output's order |
+| Tiles | 128 x 128 x 64 (8 warps, 3 stages), or 64 x 64 x 64 (4 warps, 4 stages) where the large tile would not fill the device twice over: the tile depends on the row count, and the two tiles give a row the same bits (one K loop of 64, the same dot), verified on sm_120 by the tests; run them on another GPU before relying on it there |
 | Numerics | FP32 accumulation of the 16-bit products, within 1e-5 of the FP64 product relative to its largest output (`tests/test_fixed_tile_gemm.py`) |
 | Determinism | a row's bits independent of the call's other rows and of the tile switch; the same bits on a repeat |
 | Measured speed | RTX 5090, 4,096 rows: 6-12% slower than torch's GEMM on the same operands (measured inside crit before the move) |
