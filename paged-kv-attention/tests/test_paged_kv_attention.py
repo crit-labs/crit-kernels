@@ -388,3 +388,27 @@ def test_a_given_workspace_holds_the_partials_and_a_small_one_is_refused():
     with pytest.raises(ValueError, match="workspace"):
         cache.attend(q, [0], [0], [296], 4, partitions=16,
                      workspace=torch.empty(floats - 1, dtype=torch.float32, device=dev))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("kind", ["fp8:row", "bf16"])
+def test_a_prompt_chunk_at_a_device_position_replays_from_one_cuda_graph(kind):
+    cache = Cache(kind, 4, 256, 256, 16, [700])
+    q = _q(64, 24, 256, 12).to(torch.bfloat16)
+    table = cache.tables[0]
+    position = torch.zeros(1, dtype=torch.int64, device=dev)
+    out = torch.empty_like(q)
+
+    def launch():
+        pk.prefill(q, cache.k, cache.v, kind, table, position, 16, key_scales=cache.ks, value_scales=cache.vs,
+                   multipliers=cache.multipliers, out=out)
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for at in (0, 5, 300, 636):
+        position.fill_(at)
+        graph.replay()
+        want = pk.prefill(q, cache.k, cache.v, kind, table, at, 16, key_scales=cache.ks, value_scales=cache.vs,
+                          multipliers=cache.multipliers)
+        assert torch.equal(out, want), at

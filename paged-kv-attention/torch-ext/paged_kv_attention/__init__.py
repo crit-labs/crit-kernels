@@ -282,7 +282,9 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
 def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scales=None, value_scales=None,
             multipliers=(1.0, 1.0), scale=None, out=None, lse=None, int8_qk=False):
     """A prompt chunk of one sequence: q [T][heads][dim] at positions position.. (their keys and values written),
-    table [pages] int32 -> out [T][heads][dim] in q's dtype (and lse [T][heads] FP32 when given), causal."""
+    table [pages] int32 -> out [T][heads][dim] in q's dtype (and lse [T][heads] FP32 when given), causal. position: an
+    int, or a one-element int64 device tensor read on the device (one launch for every position: a captured graph of
+    the chunk replays at any; its keys reach position + T)."""
     k_kind = _check_kind(kind, key_scales)
     if int8_qk and k_kind != 3:
         raise ValueError("int8_qk multiplies INT8 queries with INT8 keys: int8 pages only")
@@ -296,10 +298,12 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
     ks = key_scales if key_scales is not None else _dummy(device)
     vs = value_scales if value_scales is not None else ks
     block_n = 64 if d <= 128 else 32
+    on_device = torch.is_tensor(position)
     _kernels._prefill_kernel[(triton.cdiv(T, 64), hq)](
-        q, kp, vp, ks, vs, table, out, lse if lse is not None else ks, T, int(position),
+        q, kp, vp, ks, vs, table, out, lse if lse is not None else ks, position if on_device else table, T,
+        0 if on_device else int(position),
         float(scale if scale is not None else d ** -0.5), float(multipliers[0]), float(multipliers[1]), q.stride(0),
         q.stride(1), out.stride(0), out.stride(1), HQ=hq, HKV=hkv, G=hq // hkv, D=d, BLOCK_M=64, BLOCK_N=block_n,
-        PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device), INT8_QK=int8_qk, LSE=lse is not None, num_warps=4,
-        num_stages=3 if int8_qk else 2)
+        PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device), INT8_QK=int8_qk, LSE=lse is not None,
+        POS_T=on_device, num_warps=4, num_stages=3 if int8_qk else 2)
     return out

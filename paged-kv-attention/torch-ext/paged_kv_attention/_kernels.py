@@ -374,12 +374,15 @@ def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr
 
 # -- prompt chunks ----------------------------------------------------------------------------------------------------
 @triton.jit
-def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_ptr, T, pos0, sm_scale, k_mult, v_mult,
-                    stride_qt, stride_qh, stride_ot, stride_oh, HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr,
-                    D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, PAGE: tl.constexpr,
-                    KIND: tl.constexpr, HW_FP8: tl.constexpr, INT8_QK: tl.constexpr, LSE: tl.constexpr):
+def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_ptr, pos_ptr, T, pos0, sm_scale, k_mult,
+                    v_mult, stride_qt, stride_qh, stride_ot, stride_oh, HQ: tl.constexpr, HKV: tl.constexpr,
+                    G: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, PAGE: tl.constexpr,
+                    KIND: tl.constexpr, HW_FP8: tl.constexpr, INT8_QK: tl.constexpr, LSE: tl.constexpr,
+                    POS_T: tl.constexpr):
     """Program (query block, query head): a chunk of one sequence's queries at positions pos0.. over its positions
-    [0, own], causal, through its page table."""
+    [0, own], causal, through its page table; with POS_T pos0 is read from pos_ptr on the device."""
+    if POS_T:
+        pos0 = tl.load(pos_ptr).to(tl.int32)
     mb = tl.program_id(0)
     head = tl.program_id(1)
     kvh = head // G
