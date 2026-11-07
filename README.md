@@ -38,8 +38,8 @@ as many variants at once as there are CPU cores, each using every core, which ca
 
 ## Local kernel development
 
-Before a kernel is published, test it from a build for your own GPU and torch only (minutes instead of the hours a full
-build takes), loaded by `kernels` in place of the Hub repository:
+Before a kernel is published, test it from a build for your own GPU and torch only (one or two minutes, against tens of
+minutes for the full build), loaded by `kernels` in place of the Hub repository:
 
 1. The build goes to `<kernel>/build/<variant>/`: the Python package, the compiled extension and `metadata.json`, the
    layout kernel-builder writes. `kernels` picks the variant matching the running system:
