@@ -8,7 +8,9 @@ techniques name them as `hub:crit-labs/<folder>` in their `kernels.json`.
 
 | Kernel | Hub repository | From crit's technique |
 | --- | --- | --- |
-| [fp8-block-rows](fp8-block-rows/CARD.md) | `crit-labs/fp8-block-rows` | quantized-projections: matched FP8 projections (E4M3 weights and activations, block or row scales) |
+| [decode-gemv](decode-gemv/CARD.md) | `crit-labs/decode-gemv` | quantized-projections: weight-only decode GEMVs for 1-16 rows (NVFP4 W4A16, FP8 and MXFP8 W8A16, BF16), each row's bits independent of the rows beside it; NVFP4 decoders for prompt GEMMs |
+| [fixed-tile-gemm](fixed-tile-gemm/CARD.md) | `crit-labs/fixed-tile-gemm` | quantized-projections: a row-invariant prompt GEMM (BF16/FP16, Triton) |
+| [fp8-block-rows](fp8-block-rows/CARD.md) | `crit-labs/fp8-block-rows` | quantized-projections: matched FP8 projections (E4M3 weights and activations, block or row scales) and the order's device reference with its fixture (tests/order, tests/fp8_block_order_tests.cu) |
 | [grouped-experts](grouped-experts/CARD.md) | `crit-labs/grouped-experts` | expert-streamed-prefill: grouped mixture-of-experts projections for prompt chunks |
 | [int-block-experts](int-block-experts/CARD.md) | `crit-labs/int-block-experts` | host-expert-arithmetic: 4-bit integer block expert projections, bit-identical to crit's CPU rows |
 | [recurrent-scans](recurrent-scans/CARD.md) | `crit-labs/recurrent-scans` | recurrent-state-recovery: kernels for the recurrent layers of hybrid models (gated delta and more) |
