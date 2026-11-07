@@ -49,7 +49,7 @@ enum CommitMode : int { kReplay = 2, kFlushPending = 3 };
 
 // Which tokens and which sequence each row of a launch reads: a step's rows from a table the host wrote, or a captured
 // round's rows from device tensors the round driver owns (row r is tokens starts[r] .. starts[r + 1] - 1, sequence
-// table[slots[r]]; -1 skips the row).
+// table[slots[r]]; -1 skips the row: its outputs are zero, no state or window is read or written).
 struct RowSource {
     const std::int32_t* meta = nullptr;     // [rows][4]: first token, tokens, sequence (-1: skip), kind
     const std::int32_t* starts = nullptr;   // [rows + 1]

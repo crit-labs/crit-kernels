@@ -191,6 +191,32 @@ def test_a_commit_runs_again_with_a_smaller_count(strategy):
 
 
 @pytest.mark.kernels_ci
+def test_a_row_of_no_sequence_writes_zeros_and_touches_no_state():
+    kh, vh, dk, dv = 2, 4, 64, 64
+    pool = Pool(1, 3, kh, vh, dk, dv, capacity=4)
+    pool.table[1] = 2   # slot 0 holds no sequence
+    pool.states.normal_()
+    before = pool.states.clone()
+    q, k, v, g, b = inputs(8, kh, vh, dk, dv, seed=4)
+    out = torch.full(v.shape, float("nan"), device=dev)
+    rs.pool_delta(out, pool.states, pool.stash, pool.control, None, q, k, v, g, b,
+                  starts=torch.tensor([0, 4, 8], dtype=torch.int32, device=dev),
+                  slots=torch.arange(2, dtype=torch.int64, device=dev), table=pool.table, rows=2, kind=rs.STASH, layer=0,
+                  capacity=4, scale=0.25)
+    assert torch.equal(out[:4], torch.zeros_like(out[:4])) and torch.isfinite(out[4:]).all()
+    assert torch.equal(pool.states, before)   # sequence 2 verified (stashed), nothing committed
+    window = torch.randn(1, 3, 40, 3, device=dev)
+    kept = window.clone()
+    x = torch.randn(8, 40, device=dev)
+    y = torch.full_like(x, float("nan"))
+    rs.pool_conv(y, window, torch.zeros(1, 3, 4, 40, device=dev), torch.zeros(1, 3, 1, dtype=torch.int32, device=dev),
+                 None, x, torch.randn(40, 4, device=dev), starts=torch.tensor([0, 4, 8], dtype=torch.int32, device=dev),
+                 slots=torch.arange(2, dtype=torch.int64, device=dev), table=pool.table, rows=2, capacity=4)
+    assert torch.equal(y[:4], torch.zeros_like(y[:4])) and torch.isfinite(y[4:]).all()
+    assert torch.equal(window, kept)
+
+
+@pytest.mark.kernels_ci
 def test_a_round_captures_and_replays():
     kh, vh, dk, dv, W, R = 2, 4, 64, 64, 3, 2
     pool = Pool(1, 4, kh, vh, dk, dv, capacity=W + 1)

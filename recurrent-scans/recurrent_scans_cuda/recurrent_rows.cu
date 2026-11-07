@@ -219,10 +219,17 @@ __device__ __forceinline__ void token_step(float (&S)[R][4], const Token<R>& u, 
 template <int R, class T>
 __global__ void __launch_bounds__(kRowThreads) pool_delta_kernel(DeltaShape d, RowInputs in, PoolDelta p, RowSource src) {
     const Row w = row_of(src, blockIdx.z);
-    if(w.sequence < 0) return;
     const int h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int ratio = d.v_heads / d.k_heads, kh = h / ratio;
     const int j0 = blockIdx.y * kRowColumns + warp * 4;
+    if(w.sequence < 0) {   // a row of no sequence (an unbound round slot): zero outputs, no state read or written
+        if(lane == 0)
+            for(int t = 0; t < w.count; ++t)
+#pragma unroll
+                for(int j = 0; j < 4; ++j)
+                    if(j0 + j < d.dv) in.out[(w.first + std::int64_t(t)) * in.out_row + std::int64_t(h) * d.dv + j0 + j] = 0.f;
+        return;
+    }
     const int blocks = d.v_heads * gridDim.y, slot = h * gridDim.y + blockIdx.y;
     const std::int64_t S_size = std::int64_t(d.v_heads) * d.dk * d.dv, head = std::int64_t(h) * d.dk * d.dv;
     float* live = p.states + w.sequence * p.state_sequence + head;
@@ -376,8 +383,12 @@ template <int W, class T>
 __global__ void __launch_bounds__(kPoolConvThreads) pool_conv_kernel(ConvInputs c, PoolConv p, RowSource src, int layers) {
     const int r = blockIdx.y / layers, layer = blockIdx.y % layers;
     const Row w = row_of(src, r);
-    if(w.sequence < 0) return;
     const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x;
+    if(w.sequence < 0) {   // a row of no sequence (an unbound round slot): zero outputs, no window read or written
+        if(ch < c.channels && w.kind != kFlush)
+            for(int t = 0; t < w.count; ++t) static_cast<T*>(c.out)[(w.first + std::int64_t(t)) * c.out_row + ch] = of_float<T>(0.f);
+        return;
+    }
     std::int32_t* pending = p.pending + layer * p.pending_layer + w.sequence * p.pending_sequence + blockIdx.x;
     __shared__ int s_n;
     if(threadIdx.x == 0) s_n = min(max(*pending, 0), p.capacity);
