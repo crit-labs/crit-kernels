@@ -1,0 +1,13 @@
+[general]
+name = "fused-norms"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+edition = 6
+
+[general.hub]
+repo-id = "crit-labs/fused-norms"
+
+[torch-noarch]

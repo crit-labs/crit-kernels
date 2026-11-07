@@ -9,6 +9,7 @@ techniques name them as `hub:crit-labs/<folder>` in their `kernels.json`.
 | Kernel | Hub repository | From crit's technique |
 | --- | --- | --- |
 | [fp8-block-rows](fp8-block-rows/CARD.md) | `crit-labs/fp8-block-rows` | quantized-projections: matched FP8 projections (E4M3 weights and activations, block or row scales) |
+| [fused-norms](fused-norms/CARD.md) | `crit-labs/fused-norms` | fused-norms: RMSNorm with a residual, head norms with rotary positions, gated norms, activation products and residual-stream mixes, one Triton launch per call (a noarch kernel: Python and Triton, no CUDA build) |
 | [grouped-experts](grouped-experts/CARD.md) | `crit-labs/grouped-experts` | expert-streamed-prefill: grouped mixture-of-experts projections for prompt chunks |
 | [int-block-experts](int-block-experts/CARD.md) | `crit-labs/int-block-experts` | host-expert-arithmetic: 4-bit integer block expert projections, bit-identical to crit's CPU rows |
 | [recurrent-scans](recurrent-scans/CARD.md) | `crit-labs/recurrent-scans` | recurrent-state-recovery: kernels for the recurrent layers of hybrid models (gated delta and more) |
