@@ -508,6 +508,55 @@ def test_mxfp4_scale_bytes_0_and_255_decode_as_the_format_defines():
 
 
 @pytest.mark.kernels_ci
+@pytest.mark.parametrize("fmt", ["nvfp4", "int4"])
+def test_the_declared_arithmetic_with_several_blocks_a_lane_bit_for_bit(fmt):
+    # hidden 512: 32 gate/up blocks, two on each of the 16 lanes; inter 256: 16 down blocks. Then 300 tokens batched
+    # (32-route items) against one alone.
+    experts = Experts(fmt, E=4, H=512, I=256, seed=41)
+    g = torch.Generator().manual_seed(42)
+    x = (torch.randn(2, experts.H, generator=g) * 3).bfloat16().to(dev)
+    ids, _ = routes(2, 2, experts.E, g, holes=False)
+    ws = gx.Workspace(2, 2, experts.E, experts.H, experts.I, dev)
+    y = gx.route_outputs(x, ids, experts.store, None, experts.layout, ws, arithmetic="declared").clone()
+    for route, row in declared_reference(experts, x, ids.cpu(), fmt).items():
+        assert y[route].cpu().tolist() == row, (fmt, route)
+    g2 = torch.Generator().manual_seed(43)
+    X = torch.randn(300, experts.H, generator=g2).bfloat16().to(dev)
+    ids2, _ = routes(300, 2, experts.E, g2, holes=False)
+    big = gx.route_outputs(X, ids2, experts.store, None, experts.layout,
+                           gx.Workspace(300, 2, experts.E, experts.H, experts.I, dev), arithmetic="declared").clone()
+    one = gx.route_outputs(X[123:124].clone(), ids2[123:124].clone(), experts.store, None, experts.layout,
+                           gx.Workspace(1, 2, experts.E, experts.H, experts.I, dev), arithmetic="declared")
+    assert torch.equal(one, big[246:248])
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("fmt,tokens", [("nvfp4", 1), ("nvfp4", 8), ("int4", 8)])
+def test_a_captured_declared_call_replays_new_routes(fmt, tokens):
+    experts = Experts(fmt, E=16, seed=61)
+    g = torch.Generator().manual_seed(62)
+    x = torch.randn(tokens, experts.H, generator=g).bfloat16().to(dev)
+    ids, w = routes(tokens, 3, experts.E, g)
+    ws = gx.Workspace(tokens, 3, experts.E, experts.H, experts.I, dev)
+    out = torch.empty(tokens, experts.H, device=dev)
+    a4 = fmt == "nvfp4"
+    gx.forward(x, ids, w, experts.store, None, experts.layout, ws, a4, out, "declared")   # outside the capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gx.forward(x, ids, w, experts.store, None, experts.layout, ws, a4, out, "declared")
+    for seed in (63, 64):
+        g2 = torch.Generator().manual_seed(seed)
+        x.copy_(torch.randn(tokens, experts.H, generator=g2).bfloat16())
+        new_ids, new_w = routes(tokens, 3, experts.E, g2)
+        ids.copy_(new_ids)
+        w.copy_(new_w)
+        graph.replay()
+        fresh = gx.Workspace(tokens, 3, experts.E, experts.H, experts.I, dev)
+        eager = gx.forward(x, ids, w, experts.store, None, experts.layout, fresh, a4, None, "declared")
+        assert torch.equal(out, eager)
+
+
+@pytest.mark.kernels_ci
 def test_one_expert_limit_for_both_plans():
     for tokens in (1, 2048):   # the one-block plan and the sorted one
         gx.Workspace(tokens, 1, gx.MAX_EXPERTS, 64, 64, dev)
