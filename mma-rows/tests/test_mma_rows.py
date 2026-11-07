@@ -159,6 +159,13 @@ def test_the_quantizers_give_the_torch_quantizers_bits():
     want_q, want_scale = fp8_rows(x)
     assert torch.equal(scale, want_scale)
     assert torch.equal(q.view(torch.uint8), want_q.view(torch.uint8))
+    for k in (1001, 20000):   # values a load apart from 8, and past what a thread holds
+        xk = (activations(5, 20480, seed=6) * 2)[:, :k]
+        qk = torch.empty(5, k, dtype=torch.float8_e4m3fn, device=dev)
+        sk = torch.empty(5, dtype=torch.float32, device=dev)
+        mr.quantize_fp8_rows(xk, qk, sk)
+        want_q, want_scale = fp8_rows(xk)
+        assert torch.equal(sk, want_scale) and torch.equal(qk.view(torch.uint8), want_q.view(torch.uint8)), k
     codes = torch.empty(37, 1024, dtype=torch.uint8, device=dev)
     blocked = torch.full((128 * 128,), 0x55, dtype=torch.uint8, device=dev)   # the padding is written too
     mr.quantize_nvfp4(x, INPUT_SCALE, codes, blocked)

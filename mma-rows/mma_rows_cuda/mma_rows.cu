@@ -71,6 +71,28 @@ __device__ __forceinline__ uint32_t nvfp4_pair(uint32_t byte, float scale) {
 #endif
 }
 
+// A word's eight E2M1 codes (element order) times the block scale (`scale` in FP32, `scale2` the same in FP16 on
+// both halves), as four BF16 pairs: one unpack and four conversions to FP16, the scale applied in FP16 (exact: at most
+// 6 significant bits, 2^-10 to 2688), then widened to BF16 (exact); elsewhere by the bit pattern in FP32.
+__device__ __forceinline__ void nvfp4_word(uint32_t word, float scale, uint32_t scale2, uint32_t* out) {
+#if CRIT_E2M1_HW
+  uint32_t h[4];
+  asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\tmov.b32 {b0, b1, b2, b3}, %4;\n\t"
+      "cvt.rn.f16x2.e2m1x2 %0, b0;\n\tcvt.rn.f16x2.e2m1x2 %1, b1;\n\t"
+      "cvt.rn.f16x2.e2m1x2 %2, b2;\n\tcvt.rn.f16x2.e2m1x2 %3, b3;\n\t}"
+      : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3]) : "r"(word));
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const __half2 v = __hmul2(*reinterpret_cast<const __half2*>(&h[i]), *reinterpret_cast<const __half2*>(&scale2));
+    const float2 f = __half22float2(v);
+    out[i] = bf16x2(f.x, f.y);
+  }
+#else
+#pragma unroll
+  for (int i = 0; i < 4; ++i) out[i] = nvfp4_pair((word >> (8 * i)) & 0xffu, scale);
+#endif
+}
+
 // Two E4M3 codes (the low 16 bits, low byte first) as a BF16 pair, times `scale` (a power of two for MXFP8).
 template <bool SCALED>
 __device__ __forceinline__ uint32_t fp8_pair(uint32_t two, float scale) {
@@ -87,8 +109,8 @@ __device__ __forceinline__ size_t scale_offset(int n, int j, int ks, int ct) {
 
 // One matrix row's kLaneBytes contiguous bytes a lane reads a step (the four lanes of a quad read 4 x kLaneBytes of the
 // row in a run), in SUBS sub-steps of 32 values: the step from `base` covers [base, base + 128 SUBS), the lane of quad
-// position tig its 32 SUBS values from base + 32 SUBS tig, sub-step q the 32 from there + 32 q. frag(q, s, lo, hi)
-// gives sub-step q's MMA s pairs: the lane's values 4 s, + 1 (lo) and 4 s + 2, + 3 (hi) of those 32. A sub-step past K
+// position tig its 32 SUBS values from base + 32 SUBS tig, sub-step q the 32 from there + 32 q. pairs(q, out)
+// gives sub-step q's 32 values as 16 BF16 pairs: MMA s takes pairs 2 s (values 4 s, + 1) and 2 s + 1 (4 s + 2, + 3). A sub-step past K
 // loads nothing and multiplies as zeros (K is a multiple of 32).
 template <int WF>
 struct Row;
@@ -114,12 +136,14 @@ struct Row<kNvfp4> {
                      : 0u;
     }
   }
-  __device__ __forceinline__ void frag(int q, int s, uint32_t& lo, uint32_t& hi) const {
-    const uint32_t w = word(c[q], s >> 1);
-    const int sh = (s & 1) * 16;
-    const float scale = e4m3(s < 4 ? sc[q] : sc[q] >> 8);
-    lo = nvfp4_pair((w >> sh) & 0xffu, scale);
-    hi = nvfp4_pair((w >> (sh + 8)) & 0xffu, scale);
+  // Sub-step q's 32 values as 16 BF16 pairs (pair i: values 2i, 2i + 1).
+  __device__ __forceinline__ void pairs(int q, uint32_t (&out)[16]) const {
+    const float s0 = e4m3(sc[q]), s1 = e4m3(sc[q] >> 8);
+    const __half2 h0 = __float2half2_rn(s0), h1 = __float2half2_rn(s1);
+    nvfp4_word(c[q].x, s0, *reinterpret_cast<const uint32_t*>(&h0), out);
+    nvfp4_word(c[q].y, s0, *reinterpret_cast<const uint32_t*>(&h0), out + 4);
+    nvfp4_word(c[q].z, s1, *reinterpret_cast<const uint32_t*>(&h1), out + 8);
+    nvfp4_word(c[q].w, s1, *reinterpret_cast<const uint32_t*>(&h1), out + 12);
   }
 };
 
@@ -136,10 +160,13 @@ struct Row<kFp8> {
       c[2 * q + 1] = load16(row + k + 16, k < p.K);
     }
   }
-  __device__ __forceinline__ void frag(int q, int s, uint32_t& lo, uint32_t& hi) const {
-    const uint32_t w = word(c[2 * q + (s >> 2)], s & 3);
-    lo = fp8_pair<false>(w, 1.f);
-    hi = fp8_pair<false>(w >> 16, 1.f);
+  __device__ __forceinline__ void pairs(int q, uint32_t (&out)[16]) const {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t w = word(c[2 * q + (i >> 2)], i & 3);
+      out[2 * i] = fp8_pair<false>(w, 1.f);
+      out[2 * i + 1] = fp8_pair<false>(w >> 16, 1.f);
+    }
   }
 };
 
@@ -158,11 +185,14 @@ struct Row<kMxfp8> {
       mx[q] = k < p.K ? __ldg(p.scales + (size_t)n * (p.K >> 5) + (k >> 5)) : 127u;
     }
   }
-  __device__ __forceinline__ void frag(int q, int s, uint32_t& lo, uint32_t& hi) const {
-    const uint32_t w = word(c[2 * q + (s >> 2)], s & 3);
+  __device__ __forceinline__ void pairs(int q, uint32_t (&out)[16]) const {
     const float scale = e8m0(mx[q]);
-    lo = fp8_pair<true>(w, scale);
-    hi = fp8_pair<true>(w >> 16, scale);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t w = word(c[2 * q + (i >> 2)], i & 3);
+      out[2 * i] = fp8_pair<true>(w, scale);
+      out[2 * i + 1] = fp8_pair<true>(w >> 16, scale);
+    }
   }
 };
 
@@ -179,10 +209,14 @@ struct Row<kBf16> {
       for (int i = 0; i < 4; ++i) c[4 * q + i] = load16(at + 16 * i, k < p.K);
     }
   }
-  __device__ __forceinline__ void frag(int q, int s, uint32_t& lo, uint32_t& hi) const {
-    const uint4& v = c[4 * q + (s >> 1)];
-    lo = (s & 1) ? v.z : v.x;
-    hi = (s & 1) ? v.w : v.y;
+  __device__ __forceinline__ void pairs(int q, uint32_t (&out)[16]) const {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      out[4 * i] = c[4 * q + i].x;
+      out[4 * i + 1] = c[4 * q + i].y;
+      out[4 * i + 2] = c[4 * q + i].z;
+      out[4 * i + 3] = c[4 * q + i].w;
+    }
   }
 };
 
@@ -260,18 +294,40 @@ __device__ __forceinline__ uint32_t nvfp4_block(const uint32_t (&w)[8], float g,
 }
 
 // One CTA a row: its scale (amax * fp32(1 / 448), at least 1e-12) and its values, as E4M3 bytes (VALUES false) or as
-// BF16 values (true: the projection's pre-pass).
+// BF16 values (true: the projection's pre-pass). Rows with K a multiple of 8 on 16-byte boundaries (aligned) read 8
+// values a load and keep up to kHeld of them a thread between the maximum and the quantization; others go by value.
+constexpr int kRowThreads = 512, kHeld = 4;
+
 template <bool VALUES>
-__global__ void __launch_bounds__(256) fp8_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, int K,
-                                                       void* __restrict__ q, int64_t ldq, float* __restrict__ scale) {
-  __shared__ float part[8];
+__global__ void __launch_bounds__(kRowThreads) fp8_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, int K,
+                                                               void* __restrict__ q, int64_t ldq,
+                                                               float* __restrict__ scale, bool aligned) {
+  __shared__ float part[kRowThreads / 32];
   __shared__ float row_scale;
   wait_prior();
   launch_next();
   const int row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const __nv_bfloat16* xr = x + (size_t)row * ldx;
   float m = 0.f;
-  for (int k = threadIdx.x; k < K; k += blockDim.x) m = nanmax(m, fabsf(__bfloat162float(xr[k])));
+  uint4 held[kHeld];
+  if (aligned) {
+#pragma unroll
+    for (int i = 0; i < kHeld; ++i) {
+      const int k = 8 * (threadIdx.x + i * kRowThreads);
+      held[i] = k < K ? __ldg(reinterpret_cast<const uint4*>(xr + k)) : make_uint4(0u, 0u, 0u, 0u);
+      const uint32_t w[4] = {held[i].x, held[i].y, held[i].z, held[i].w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) m = nanmax(nanmax(m, fabsf(bf16_lo(w[j]))), fabsf(bf16_hi(w[j])));
+    }
+    for (int k = 8 * (threadIdx.x + kHeld * kRowThreads); k < K; k += 8 * kRowThreads) {
+      const uint4 v = __ldg(reinterpret_cast<const uint4*>(xr + k));
+      const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) m = nanmax(nanmax(m, fabsf(bf16_lo(w[j]))), fabsf(bf16_hi(w[j])));
+    }
+  } else {
+    for (int k = threadIdx.x; k < K; k += blockDim.x) m = nanmax(m, fabsf(__bfloat162float(xr[k])));
+  }
 #pragma unroll
   for (int o = 16; o; o >>= 1) m = nanmax(m, __shfl_xor_sync(0xffffffffu, m, o));
   if (lane == 0) part[warp] = m;
@@ -279,16 +335,44 @@ __global__ void __launch_bounds__(256) fp8_rows_kernel(const __nv_bfloat16* __re
   if (threadIdx.x == 0) {
     float a = 0.f;
     for (int w = 0; w < (int)(blockDim.x >> 5); ++w) a = nanmax(a, part[w]);
-    const float s = a * kRcp448;
-    row_scale = s < 1e-12f ? 1e-12f : s;
+    const float sc = a * kRcp448;
+    row_scale = sc < 1e-12f ? 1e-12f : sc;
     scale[row] = row_scale;
   }
   __syncthreads();
-  const float s = row_scale;
-  for (int k = threadIdx.x; k < K; k += blockDim.x) {
-    const float v = fp8_value(__bfloat162float(xr[k]), s);
-    if constexpr (VALUES) static_cast<__nv_bfloat16*>(q)[(size_t)row * ldq + k] = __float2bfloat16_rn(v);
-    else static_cast<uint8_t*>(q)[(size_t)row * ldq + k] = static_cast<uint8_t>(e4m3_bits(v));
+  const float sc = row_scale;
+  auto put8 = [&](int k, const uint4& v) {
+    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+    if constexpr (VALUES) {
+      uint32_t o[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) o[j] = bf16x2(fp8_value(bf16_lo(w[j]), sc), fp8_value(bf16_hi(w[j]), sc));
+      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(q) + (size_t)row * ldq + k) = make_uint4(o[0], o[1], o[2], o[3]);
+    } else {
+      uint32_t lo = 0, hi = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint32_t two = e4m3_bits(fp8_value(bf16_lo(w[j]), sc)) | (e4m3_bits(fp8_value(bf16_hi(w[j]), sc)) << 8);
+        if (j < 2) lo |= two << (16 * j);
+        else hi |= two << (16 * (j - 2));
+      }
+      *reinterpret_cast<uint2*>(static_cast<uint8_t*>(q) + (size_t)row * ldq + k) = make_uint2(lo, hi);
+    }
+  };
+  if (aligned) {
+#pragma unroll
+    for (int i = 0; i < kHeld; ++i) {
+      const int k = 8 * (threadIdx.x + i * kRowThreads);
+      if (k < K) put8(k, held[i]);
+    }
+    for (int k = 8 * (threadIdx.x + kHeld * kRowThreads); k < K; k += 8 * kRowThreads)
+      put8(k, __ldg(reinterpret_cast<const uint4*>(xr + k)));
+  } else {
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+      const float v = fp8_value(__bfloat162float(xr[k]), sc);
+      if constexpr (VALUES) static_cast<__nv_bfloat16*>(q)[(size_t)row * ldq + k] = __float2bfloat16_rn(v);
+      else static_cast<uint8_t*>(q)[(size_t)row * ldq + k] = static_cast<uint8_t>(e4m3_bits(v));
+    }
   }
 }
 
@@ -370,6 +454,7 @@ __global__ void __launch_bounds__(kMaxWarps * 32) mma_kernel(const Problem p) {
   const int s_lo = split * steps / p.splits, s_hi = (split + 1) * steps / p.splits;
   const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(p.x);
 
+  // One accumulator chain a tile (two chains, even and odd MMAs, measured slower: more registers, fewer warps).
   float c[R][T][4];
 #pragma unroll
   for (int g = 0; g < R; ++g)
@@ -398,15 +483,15 @@ __global__ void __launch_bounds__(kMaxWarps * 32) mma_kernel(const Problem p) {
 #pragma unroll
       for (int t = 0; t < T; ++t) act_frags(p, x, 8 * t + gid, kb, kb < p.K, b[t]);
 #pragma unroll
-      for (int s = 0; s < 8; ++s) {
+      for (int g = 0; g < R; ++g) {
+        uint32_t pa[16], pb[16];   // MMA s takes pairs 2 s (values 4 s, + 1) and 2 s + 1 of rows gid and gid + 8
+        wa[g].pairs(q, pa);
+        wb[g].pairs(q, pb);
 #pragma unroll
-        for (int g = 0; g < R; ++g) {
-          uint32_t a0, a1, a2, a3;
-          wa[g].frag(q, s, a0, a2);
-          wb[g].frag(q, s, a1, a3);
+        for (int s = 0; s < 8; ++s)
 #pragma unroll
-          for (int t = 0; t < T; ++t) mma(c[g][t], a0, a1, a2, a3, b[t][2 * s], b[t][2 * s + 1]);
-        }
+          for (int t = 0; t < T; ++t)
+            mma(c[g][t], pa[2 * s], pb[2 * s], pa[2 * s + 1], pb[2 * s + 1], b[t][2 * s], b[t][2 * s + 1]);
       }
     }
     if (++st < s_hi) load(st);
@@ -509,9 +594,9 @@ cudaError_t enqueue(const Problem& given, cudaStream_t stream) {
     float* scales = reinterpret_cast<float*>(p.scratch + ((size_t)p.M * p.K * 2 + 15) / 16 * 16);
     cudaError_t e;
     if (p.acts == kActFp8Rows) {
-      e = launch_kernel(fp8_rows_kernel<true>, dim3(p.M), dim3(256), stream,
+      e = launch_kernel(fp8_rows_kernel<true>, dim3(p.M), dim3(kRowThreads), stream,
                         static_cast<const __nv_bfloat16*>(p.x), p.ldx, p.K, static_cast<void*>(values), (int64_t)p.K,
-                        scales);
+                        scales, p.K % 8 == 0 && p.ldx % 8 == 0);
     } else {
       const int64_t threads = (int64_t)p.M * (p.K >> 4);
       e = launch_kernel(nvfp4_values_kernel, dim3((unsigned)((threads + 255) / 256)), dim3(256), stream,
@@ -534,8 +619,10 @@ cudaError_t enqueue(const Problem& given, cudaStream_t stream) {
 cudaError_t enqueue_quantize_fp8_rows(const void* x, int64_t ldx, int M, int K, std::uint8_t* q, int64_t ldq,
                                       float* scale, cudaStream_t stream) {
   if (M < 1 || K < 1) return cudaErrorInvalidValue;
-  return launch_kernel(fp8_rows_kernel<false>, dim3(M), dim3(256), stream, static_cast<const __nv_bfloat16*>(x), ldx,
-                       K, static_cast<void*>(q), ldq, scale);
+  const bool aligned = K % 8 == 0 && ldx % 8 == 0 && ldq % 8 == 0 && reinterpret_cast<std::uintptr_t>(x) % 16 == 0 &&
+                       reinterpret_cast<std::uintptr_t>(q) % 8 == 0;
+  return launch_kernel(fp8_rows_kernel<false>, dim3(M), dim3(kRowThreads), stream, static_cast<const __nv_bfloat16*>(x),
+                       ldx, K, static_cast<void*>(q), ldq, scale, aligned);
 }
 
 cudaError_t enqueue_quantize_nvfp4(const void* x, int64_t ldx, int M, int K, float input_scale, float input_rcp,
