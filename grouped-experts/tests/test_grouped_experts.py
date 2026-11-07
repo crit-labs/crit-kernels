@@ -24,8 +24,8 @@ def components(fmt, H, I):
     if fmt == "bf16":
         return [("gate_up", 4 * I * H), ("down", 2 * H * I)]
     if fmt.startswith("fp8"):
-        gs, ds = ((8 * I, 4 * H) if fmt == "fp8:channel" else
-                  (4 * cdiv(2 * I, 128) * cdiv(H, 128), 4 * cdiv(H, 128) * cdiv(I, 128)))
+        gs, ds = ((8 * I, 4 * H) if fmt == "fp8:channel" else   # fp8:block: gate's grid, then up's
+                  (4 * 2 * cdiv(I, 128) * cdiv(H, 128), 4 * cdiv(H, 128) * cdiv(I, 128)))
         return [("gate_up", 2 * I * H), ("gate_up_scale", gs), ("down", H * I), ("down_scale", ds)]
     if fmt in ("nvfp4", "int4"):
         return [("gate_up", I * H), ("gate_up_scale", I * H // 8), ("gate_up_inverse", 8 * I), ("down", H * I // 2),
@@ -86,7 +86,12 @@ def bundle(fmt, H, I, g, inputs=(0.0, 0.0)):
     """One expert's bundle (uint8 on the device) and its decoded FP64 gate/up and down matrices."""
     o, size = offsets(fmt, H, I)
     out = torch.zeros(size, dtype=torch.uint8)
-    gu, gu_values = matrix(fmt, 2 * I, H, g)
+    if fmt == "fp8:block":   # gate and up each with its own 128 x 128 scale grid
+        (gate, gate_values), (up, up_values) = matrix(fmt, I, H, g), matrix(fmt, I, H, g)
+        gu = {k: torch.cat([gate[k], up[k]]) for k in gate}
+        gu_values = torch.cat([gate_values, up_values])
+    else:
+        gu, gu_values = matrix(fmt, 2 * I, H, g)
     dn, dn_values = matrix(fmt, H, I, g)
     for prefix, parts in (("gate_up", gu), ("down", dn)):
         for suffix, t in parts.items():
@@ -440,6 +445,28 @@ def test_long_reductions_give_the_same_bits_in_decode_and_prompt(fmt, a4):
     out = experts.forward(x[:6], ids[:6], w[:6])
     ref = experts.reference(x[:6], ids[:6].cpu(), w[:6].cpu())
     assert (out.double().cpu() - ref).abs().max() <= (3e-2 if a4 else 5e-3) * ref.abs().max()
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("fmt,a4", CASES)
+def test_partial_128_blocks_give_decode_the_prompt_bits_and_match_the_fp64_reference(fmt, a4):
+    # hidden 320 and inter 192 (64 mod 128): the last 128-k block of each matrix and the last fp8:block scale rows of
+    # gate and up are half blocks.
+    experts = Experts(fmt, E=8, H=320, I=192, seed=5, a4=a4)
+    g = torch.Generator().manual_seed(6)
+    T, top = 300, 4
+    x = torch.randn(T, experts.H, generator=g).bfloat16().to(dev)
+    ids, w = routes(T, top, experts.E, g)
+    valid = (ids.reshape(-1) >= 0).cpu()
+    full = experts.rows(x, ids)   # the sorted plan, 32-route items
+    for width in (8, 32, 64):
+        for first, count in ((0, 1), (3, 5), (50, 250)):
+            part = experts.rows(x[first:first + count].clone(), ids[first:first + count].clone(), width=width)
+            sel = valid[first * top:(first + count) * top]
+            assert torch.equal(part[sel], full[first * top:(first + count) * top][sel]), (fmt, width, first, count)
+    out = experts.forward(x[:12], ids[:12], w[:12]).double().cpu()
+    ref = experts.reference(x[:12], ids[:12].cpu(), w[:12].cpu())
+    assert (out - ref).abs().max() <= (3e-2 if a4 else 5e-3) * ref.abs().max(), fmt
 
 
 def e8m0(byte):

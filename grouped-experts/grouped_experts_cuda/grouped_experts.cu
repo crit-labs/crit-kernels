@@ -290,6 +290,14 @@ __device__ __forceinline__ void stage_async(const Pass& p, const int* routes, in
     copy_commit();
 }
 
+// The fp8:block scale-grid row of a matrix row: gate/up holds gate's grid and then up's ([2 ceil(I / 128)][ceil(H /
+// 128)]), so an inter width of 64 mod 128 keeps gate and up blocks apart; down's grid is its own.
+template <bool GATEUP>
+__device__ __forceinline__ int block_row(int row, int inter) {
+    if constexpr(GATEUP) return row < inter ? row / 128 : (inter + 127) / 128 + (row - inter) / 128;
+    return row / 128;
+}
+
 // One block: item blockIdx.y, WARPS warps of TILES MMA row tiles each: down, 16 output rows a tile; gate/up, 8 inter
 // rows a tile, its 8 gate rows over the same 8 up rows, so a lane holds both halves of its SwiGLU. Which rows a warp
 // owns changes no output's MMA chain, so decode (TILES 1: more warps an expert) and prompt (TILES 2) agree bit for bit.
@@ -443,8 +451,8 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
                     const float* bs = reinterpret_cast<const float*>(scales);
 #pragma unroll
                     for(int t = 0; t < TILES; ++t) {
-                        const float s_lo = bs[(rows[2 * t] / 128) * kblocks + kb / 2];
-                        const float s_hi = bs[(rows[2 * t + 1] / 128) * kblocks + kb / 2];
+                        const float s_lo = bs[block_row<GATEUP>(rows[2 * t], I) * kblocks + kb / 2];
+                        const float s_hi = bs[block_row<GATEUP>(rows[2 * t + 1], I) * kblocks + kb / 2];
 #pragma unroll
                         for(int n = 0; n < NT; ++n) {
                             if(n >= active) break;
