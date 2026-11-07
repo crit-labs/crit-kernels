@@ -440,3 +440,41 @@ def test_long_reductions_give_the_same_bits_in_decode_and_prompt(fmt, a4):
     out = experts.forward(x[:6], ids[:6], w[:6])
     ref = experts.reference(x[:6], ids[:6].cpu(), w[:6].cpu())
     assert (out.double().cpu() - ref).abs().max() <= (3e-2 if a4 else 5e-3) * ref.abs().max()
+
+
+def e8m0(byte):
+    """An E8M0 scale byte's value as the format defines it: 2^(byte - 127), byte 255 NaN."""
+    return float("nan") if byte == 255 else math.ldexp(1.0, byte - 127)
+
+
+def mxfp4_values(store, e, offset, scale_offset, rows, cols):
+    codes = store[e, offset:offset + rows * cols // 2].view(rows, cols // 2)
+    vals = torch.stack([E2M1_SIGNED[(codes & 15).long()], E2M1_SIGNED[(codes >> 4).long()]], -1).reshape(rows, cols)
+    s = store[e, scale_offset:scale_offset + rows * cols // 32].view(rows, cols // 32)
+    scale = torch.tensor([[e8m0(int(b)) for b in row] for row in s.tolist()], dtype=torch.float64)
+    return vals * scale.repeat_interleave(32, 1)
+
+
+@pytest.mark.kernels_ci
+def test_mxfp4_scale_bytes_0_and_255_decode_as_the_format_defines():
+    experts = Experts("mxfp4", E=2, H=128, I=64, seed=51)
+    H, I = experts.H, experts.I
+    o, _ = offsets("mxfp4", H, I)
+    store = experts.store.cpu()
+    scales = store[:, o["gate_up_scale"]:o["gate_up_scale"] + 2 * I * H // 32].view(2, 2 * I, H // 32)
+    scales[0, :I] = 0     # expert 0: every gate weight times 2^-127 (BF16 subnormals and their neighbours)
+    scales[0, I:] = 127   # and its up weights times 1
+    scales[1, 1, 1] = 255   # expert 1: one block of gate row 1 NaN
+    experts.store = store.to(dev)
+    g = torch.Generator().manual_seed(52)
+    x = (torch.randn(2, H, generator=g) * 2.0 ** 20).bfloat16().to(dev)   # products of 2^-127 weights stay normal
+    ids = torch.tensor([[0], [1]], device=dev)
+    w = torch.ones(2, 1, device=dev)
+    out = experts.forward(x, ids, w).double().cpu()
+    gate_up = mxfp4_values(store, 0, o["gate_up"], o["gate_up_scale"], 2 * I, H)
+    down = mxfp4_values(store, 0, o["down"], o["down_scale"], H, I)
+    gu = gate_up @ x[0].double().cpu()
+    h = (torch.nn.functional.silu(gu[:I]) * gu[I:]).float().bfloat16().double()
+    ref = down @ h
+    assert bool(ref.abs().max() > 0) and (out[0] - ref).abs().max() <= 5e-3 * ref.abs().max()
+    assert bool(torch.isnan(out[1]).all())

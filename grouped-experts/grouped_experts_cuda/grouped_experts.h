@@ -9,7 +9,8 @@
 //
 // The arithmetic is one function of a route and its expert, whatever the item, the chunk or the rows beside it, so
 // decode rows and prompt chunks give the same bits and a token's result never depends on its neighbours:
-//   - weights decode exactly to BF16 (bf16; E4M3 codes; E2M1 x E4M3 block scale; INT4 x E4M3; E2M1 x 2^(e - 127));
+//   - weights decode exactly to BF16 (bf16; E4M3 codes; E2M1 x E4M3 block scale; INT4 x E4M3; E2M1 x 2^(e - 127),
+//     the E8M0 byte 0 being 2^-127 and 255 NaN);
 //   - activations in BF16, or (nvfp4 with `a4`) quantized per route by crit's declared NVFP4 quantizer at the expert's
 //     input scale, the operand e2m1 x decoded scale (exact in BF16);
 //   - mma.sync m16n8k16 BF16 -> FP32, k in 64-element blocks in ascending order (lane quad t4 holds the 16 values

@@ -33,7 +33,7 @@ engine's shapes, and keep the faster one that keeps the same row invariance.
 
 | | |
 | --- | --- |
-| Weight formats | bf16; fp8 E4M3 with one FP32 scale per row or per 128 x 128 block; nvfp4 (E2M1, E4M3 scale per 16, a 1 / global scale per row); int4 (two's complement, E4M3 scale per 16, optional 1 / global scale per row); mxfp4 (E2M1, E8M0 scale per 32) |
+| Weight formats | bf16; fp8 E4M3 with one FP32 scale per row or per 128 x 128 block; nvfp4 (E2M1, E4M3 scale per 16, a 1 / global scale per row); int4 (two's complement, E4M3 scale per 16, optional 1 / global scale per row); mxfp4 (E2M1, E8M0 scale per 32: 2^(byte - 127), byte 0 is 2^-127 and byte 255 NaN) |
 | Activations | BF16 (W4A16 / W8A16 / W16A16); nvfp4 W4A4: inputs and the intermediate quantized per route by crit's declared NVFP4 quantizer at each expert's input scales |
 | GPUs | NVIDIA sm_80 and newer (mma.sync m16n8k16 BF16, no architecture-specific instruction; E4M3 conversion in hardware from sm_89) |
 | Shapes | hidden and inter multiples of 64; any token count up to 65,535 items a call, any top-k and expert count (< 2^22) |

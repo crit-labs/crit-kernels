@@ -34,6 +34,14 @@ __device__ __forceinline__ float e4m3_value(uint32_t b) {
     return __half2float(__ushort_as_half(h)) * 256.0f;
 }
 
+// An E8M0 scale byte as a BF16 pair of 2^(byte - 127), as the format defines it: byte 0 is 2^-127 (a BF16
+// subnormal) and byte 255 NaN.
+__device__ __forceinline__ bf162 e8m0_pair(uint32_t b) {
+    b &= 0xFFu;
+    const uint32_t bits = b == 0u ? 0x0040u : b == 255u ? 0x7FC0u : b << 7;
+    return b2(bits | (bits << 16));
+}
+
 // Eight E2M1 codes of a word (element 2i in the low nibble of byte i) as four BF16 pairs, exactly, by two byte
 // permutations per four elements: the magnitude's high and low BF16 bytes from 8-entry tables, the sign from bit 3.
 __device__ __forceinline__ void e2m1x8(uint32_t w, uint32_t* out) {
@@ -189,8 +197,7 @@ __device__ __forceinline__ void decode(const Raw<F>& r, uint32_t* f) {
     } else {
         bf162 s2;
         if constexpr(F == int(Format::mxfp4)) {
-            const uint32_t bits = (r.s & 0xFFu) << 7;
-            s2 = b2(bits | (bits << 16));
+            s2 = e8m0_pair(r.s);
         } else {
             const bf16 s = __float2bfloat16_rn(e4m3_value(r.s));
             s2 = __halves2bfloat162(s, s);
@@ -225,8 +232,7 @@ template <int F>
 __device__ __forceinline__ void decode_table(const Raw<F>& r, const uint32_t* table, uint32_t* f) {
     bf162 s2;
     if constexpr(F == int(Format::mxfp4)) {
-        const uint32_t bits = (r.s & 0xFFu) << 7;
-        s2 = b2(bits | (bits << 16));
+        s2 = e8m0_pair(r.s);
     } else {
         const bf16 s = __float2bfloat16_rn(e4m3_value(r.s));
         s2 = __halves2bfloat162(s, s);
