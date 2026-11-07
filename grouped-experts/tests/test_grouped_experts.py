@@ -419,3 +419,24 @@ def test_the_declared_arithmetic_is_the_integer_block_order_bit_for_bit(fmt):
         experts.a4 = True
         ref = experts.reference(x, ids.cpu(), w.cpu())
         assert (out - ref).abs().max() <= 3e-2 * ref.abs().max()
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("fmt,a4", [("nvfp4", False), ("nvfp4", True), ("bf16", False), ("fp8:block", False)])
+def test_long_reductions_give_the_same_bits_in_decode_and_prompt(fmt, a4):
+    # hidden 2048 and inter 1152: long k loops through the decode items' prefetch rings and the prompt items' staging
+    # halves give the same bits.
+    experts = Experts(fmt, E=8, H=2048, I=1152, seed=31, a4=a4)
+    g = torch.Generator().manual_seed(32)
+    T, top = 40, 2
+    x = torch.randn(T, experts.H, generator=g).bfloat16().to(dev)
+    ids, w = routes(T, top, experts.E, g)
+    prompt_rows = experts.rows(x, ids, width=32)
+    valid = (ids.reshape(-1) >= 0).cpu()
+    for first, count in ((0, 1), (7, 4), (30, 10)):
+        part = experts.rows(x[first:first + count].clone(), ids[first:first + count].clone(), width=8)
+        sel = valid[first * top:(first + count) * top]
+        assert torch.equal(part[sel], prompt_rows[first * top:(first + count) * top][sel]), (fmt, first)
+    out = experts.forward(x[:6], ids[:6], w[:6])
+    ref = experts.reference(x[:6], ids[:6].cpu(), w[:6].cpu())
+    assert (out.double().cpu() - ref).abs().max() <= (3e-2 if a4 else 5e-3) * ref.abs().max()

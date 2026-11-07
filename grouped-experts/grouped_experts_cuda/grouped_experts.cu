@@ -143,11 +143,10 @@ struct Raw {
 
 template <int F, int TILES>
 __host__ __device__ constexpr int depth() {   // 64-k blocks of weights in flight per warp (deeper with fewer rows)
-    return F == int(Format::bf16) ? (TILES == 1 ? 4 : 2)
-           : (F == int(Format::fp8_channel) || F == int(Format::fp8_block)) ? (TILES == 1 ? 6 : 3)
-           : (TILES == 1 ? 8 : 4);
+    return F == int(Format::bf16) ? (TILES == 1 ? 3 : 2)
+           : (F == int(Format::fp8_channel) || F == int(Format::fp8_block)) ? (TILES == 1 ? 4 : 3)
+           : (TILES == 1 ? 6 : 4);
 }
-constexpr int kOperandDepth = 2;   // decode items: 64-k blocks of B operands in flight (from L2: x and h are small)
 
 // The lane's 16 weights k .. k + 15 of `row` (k a multiple of 16).
 template <int F>
@@ -355,9 +354,7 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
         brow = r >= 0 ? p.in + static_cast<long long>(r / p.in_div) * K + 16 * t4 : nullptr;
     }
     Raw<F> ring[D][ROWS];
-    constexpr int DB = kDirect ? kOperandDepth : 1;
-    static_assert(D % DB == 0, "the operand ring divides the weight ring");
-    uint4 bring[DB][2];
+    uint4 bring[kDirect ? D : 1][2];   // decode items: B operands in flight as deep as the weights
     if(live) {
 #pragma unroll
         for(int d = 0; d < D; ++d)
@@ -365,13 +362,11 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
 #pragma unroll
                 for(int r = 0; r < ROWS; ++r) ring[d][r] = load_raw<F>(codes, scales, rows[r], K, 64 * d + 16 * t4);
                 if constexpr(kDirect) {
-                    if(d < DB) {
-                        if(brow) {
-                            bring[d % DB][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d));
-                            bring[d % DB][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d) + 1);
-                        } else {
-                            bring[d % DB][0] = bring[d % DB][1] = make_uint4(0u, 0u, 0u, 0u);
-                        }
+                    if(brow) {
+                        bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d));
+                        bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d) + 1);
+                    } else {
+                        bring[d][0] = bring[d][1] = make_uint4(0u, 0u, 0u, 0u);
                     }
                 }
             }
@@ -401,16 +396,18 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
             }
             uint4 b_now[2];
             if constexpr(kDirect) {
-                b_now[0] = bring[d % DB][0];
-                b_now[1] = bring[d % DB][1];
-                if(brow && kb + DB < blocks) {
-                    bring[d % DB][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + DB)));
-                    bring[d % DB][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + DB)) + 1);
-                }
+                b_now[0] = bring[d][0];
+                b_now[1] = bring[d][1];
             }
             if(kb + D < blocks) {
 #pragma unroll
                 for(int r = 0; r < ROWS; ++r) ring[d][r] = load_raw<F>(codes, scales, rows[r], K, 64 * (kb + D) + 16 * t4);
+                if constexpr(kDirect) {
+                    if(brow) {
+                        bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)));
+                        bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)) + 1);
+                    }
+                }
             }
 #pragma unroll
             for(int n = 0; n < NT; ++n) {
