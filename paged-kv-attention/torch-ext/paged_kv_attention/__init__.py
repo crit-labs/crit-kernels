@@ -87,12 +87,15 @@ def _dummy(device):
     return found
 
 
-def partitions(device, kv_heads):
-    """A default partition count for a cache of `kv_heads` heads on `device`: about one and a half programs per SM
-    for one row (a power of two within 8..128; measured best at 256-wide heads with 4 KV heads and 128-wide with 8 on
-    an sm_120 GPU). A column's bits depend on it, so keep one count for every launch whose results must agree."""
+def partitions(device, kv_heads, kind):
+    """A default partition count for a cache of `kv_heads` heads of page kind `kind` on `device`, for one long row:
+    about one and a half programs per SM over converted pages (FP8, INT8), three quarters of one over 16-bit pages,
+    whose pieces carry four times the bytes (a power of two within 8..128; measured best at 200K positions with 2, 4
+    and 8 KV heads of 256 and 128 on an sm_120 GPU). A column's bits depend on it, so keep one count for every launch
+    whose results must agree."""
     sms = _capability(torch.device(device))[1]
-    return max(8, min(128, triton.next_power_of_2(max(1, (3 * sms) // (2 * max(1, kv_heads))))))
+    programs = (3 * sms) // (2 if KINDS[kind] else 4)
+    return max(8, min(128, triton.next_power_of_2(max(1, programs // max(1, kv_heads)))))
 
 
 def piece_size(head_dim, value_dim, kind="bf16"):
@@ -214,7 +217,7 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
         raise ValueError("q's last dimension is contiguous")
     g = hq // hkv
     device = q.device
-    parts = int(partitions or globals()["partitions"](device, hkv))
+    parts = int(partitions or globals()["partitions"](device, hkv, kind))
     scale = float(scale if scale is not None else d ** -0.5)
     out = torch.empty(T, hq, dv, dtype=q.dtype, device=device) if out is None else out
     kp, vp = _codes(key_pages, kind, device), _codes(value_pages, kind, device)
