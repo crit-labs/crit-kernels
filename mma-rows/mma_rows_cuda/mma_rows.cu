@@ -444,7 +444,9 @@ __device__ __forceinline__ void finish(const Problem& p, int tok, int n, float v
 // One CTA: a row tile (warps x 16 R matrix rows, each warp its own) times every token (up to 8 T) over split
 // blockIdx.y of K's steps.
 template <int WF, int ACT, int R, int T>
-__global__ void __launch_bounds__(kMaxWarps * 32) mma_kernel(const Problem p) {
+// Decode tiles (up to 16 rows) at most 128 registers a thread, so four CTAs of four warps fit a multiprocessor (a few
+// percent faster than the compiler's own choice at 1-4 rows); prompt tiles as the compiler likes.
+__global__ void __launch_bounds__(kMaxWarps * 32, T <= 2 ? 4 : 1) mma_kernel(const Problem p) {
   constexpr int SUBS = Row<WF>::SUBS, STEP = 128 * SUBS;
   __shared__ int last;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;

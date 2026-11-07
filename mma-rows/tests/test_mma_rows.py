@@ -135,7 +135,7 @@ def test_a_row_keeps_its_bits_alone_and_among_up_to_64_and_whatever_the_groups_a
     x = activations(64, k)
     alone = torch.cat([call(x[r:r + 1].clone(), stored, weights, acts, blocked, splits=splits) for r in range(64)])
     for rows in list(range(2, 18)) + [23, 31, 32, 33, 47, 64]:
-        for groups, warps in ((1, 4), (2, 4), (1, 1), (2, 8)):
+        for groups, warps in ((1, 4), (2, 4), (1, 1), (2, 2)):
             part = call(x[:rows], stored, weights, acts, blocked, groups=groups, warps=warps, splits=splits)
             assert torch.equal(part, alone[:rows]), (weights, acts, rows, groups, warps, splits)
 
@@ -244,7 +244,7 @@ def test_plan_comes_from_the_shape_and_the_device():
                           (248320, 2560, "fp8"), (2560, 640, "nvfp4"), (44032, 7168, "nvfp4"), (7168, 22016, "nvfp4")):
         groups, warps, splits = mr.plan(n, k, weights)
         assert (groups, warps, splits) == mr.plan(n, k, weights)
-        assert groups in (1, 2) and 1 <= warps <= 8
+        assert groups in (1, 2) and 1 <= warps <= 4
         assert 1 <= splits <= min(32, math.ceil(k / mr.VALUES[weights]))
         tiles = mr.row_tiles(n, groups, warps)
         assert tiles * splits >= min(sms, tiles * math.ceil(k / mr.VALUES[weights]), tiles * 32)

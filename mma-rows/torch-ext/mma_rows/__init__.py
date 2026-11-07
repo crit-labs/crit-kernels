@@ -27,7 +27,7 @@ ACTS = {"bf16": 0, "fp8_rows": 1, "nvfp4": 2}
 MAX_ROWS = 64     # activation rows a call takes
 STEP = 32         # K is a multiple of it
 VALUES = {name: int(ops.step_values(code)) for name, code in WEIGHTS.items()}   # K a step takes (the kernel's)
-MAX_WARPS, MAX_SPLITS = 8, 32
+MAX_WARPS, MAX_SPLITS = 4, 32
 WARPS = 4          # warps a CTA, each its own 16 x groups matrix rows
 CTAS_PER_SM = 3    # CTAs plan() asks of each multiprocessor, through splits of K where the rows are too few
 

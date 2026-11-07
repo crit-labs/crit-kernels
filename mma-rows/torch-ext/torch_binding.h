@@ -8,7 +8,7 @@
 // with E4M3 block scales and row_scale = one over each row's global scale; 1 FP8 E4M3 [N][K] with row_scale; 2 MXFP8
 // E4M3 [N][K] with E8M0 scales [N][K / 32]; 3 BF16 [N][K]); acts: 0 x as it is, 1 x quantized per row to E4M3 (FP8
 // weights), 2 x quantized per 16-value block to NVFP4 under input_scale (NVFP4 weights). blocked: NVFP4 scales in
-// cuBLASLt's 128 x 4 tiled layout. groups (1, 2): 16-row groups a warp takes; warps (1..8): warps a CTA (speed only).
+// cuBLASLt's 128 x 4 tiled layout. groups (1, 2): 16-row groups a warp takes; warps (1..4): warps a CTA (speed only).
 // splits (1..32): contiguous parts of K, one a CTA, part of the sums' order; splits > 1 take partial (FP32,
 // splits * M * N) and counters (int32 zeros, one a row tile). Quantized activations take scratch (M * K * 2 + M * 4
 // bytes, rounded to 16).

@@ -44,7 +44,7 @@
 namespace crit::kernels::mma_rows {
 
 constexpr int kMaxRows = 64;     // activation rows a call takes (8 MMA columns at a time)
-constexpr int kMaxWarps = 8;
+constexpr int kMaxWarps = 4;     // warps a CTA (decode tiles keep four CTAs a multiprocessor)
 constexpr int kMaxSplits = 32;
 constexpr int kStep = 32;        // K is a multiple of it (a lane's sub-step)
 #ifndef CRIT_MMA_LANE_BYTES

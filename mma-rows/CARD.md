@@ -29,7 +29,7 @@ serial decoding.
 | Numerics | every value enters the MMA exactly in BF16 (an E2M1 code times its E4M3 scale, an E4M3 code, times its power of two for MXFP8, a BF16 weight; a BF16 activation or its quantized value), FP32 accumulation, the row, activation and global scales after the sum. Within 2e-5 of the FP64 product relative to the products' magnitude (`tests/test_mma_rows.py`) |
 | Determinism | a sum's order is fixed by N, K and the plan's splits of K (plan(): from the shape and the device's multiprocessor count); the rows a call takes, `groups` and `warps` change no bits. The split CTAs' partial sums add in split order (the last CTA of a row tile adds them). A row's bits are the same alone and among up to 63 others, and on a repeat |
 | Capture | no allocation and no host synchronization (the caller gives scratch, partial-sum and counter buffers; the counters are left zero): a CUDA graph captures a call |
-| Measured speed | RTX 5090 (see the tables in the measurements below) |
+| Measured speed | RTX 5090, a call's GPU time in a captured graph over matrices that leave the 96 MB L2, at 1 / 4 / 16 rows: NVFP4 W4A16 34816 x 5120 68 / 70 / 99 us (1.47 / 1.43 / 1.02 TB/s), 5120 x 17408 36 / 39 / 56 us; W4A4 (the activations quantized by the pre-pass) the same within 2%; FP8 W8A8 16384 x 5120 55 / 56 / 66 us (1.54 TB/s at 1 row), 5120 x 6144 24 / 25 / 32 us, a 248320 x 5120 head 774 / 778 / 797 us (1.64 / 1.59 TB/s); against a CUDA-core GEMV (decode-gemv) at 1 row 7-10% slower for NVFP4, faster from 4 rows on, about twice as fast at 16 rows; FP8 faster at every count. Past 16 rows the MMAs and decodes grow with the rows (64 rows: 3-5x the 1-row time), so a provider's GEMM wins sooner for activations it takes as they are |
 
 ## Check it first
 
