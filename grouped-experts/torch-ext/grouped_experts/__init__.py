@@ -21,11 +21,13 @@ import torch
 
 from ._ops import ops
 
-__all__ = ["ARITHMETICS", "FORMATS", "SMALL_PLAN", "Workspace", "combine", "forward", "quantize_e2m1x2", "route_outputs",
-           "width_for"]
+__all__ = ["ARITHMETICS", "FORMATS", "MAX_EXPERTS", "MAX_ITEMS", "SMALL_PLAN", "Workspace", "combine", "forward",
+           "quantize_e2m1x2", "route_outputs", "width_for"]
 
 FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5}
 SMALL_PLAN = 1024   # routes the one-block plan takes; larger calls group their routes from a stable sort
+MAX_ITEMS = 65535   # a call's items (the launches' second grid dimension)
+MAX_EXPERTS = 65535   # the experts a call may name, in either plan
 
 
 def width_for(routes, experts):
@@ -41,13 +43,15 @@ class Workspace:
 
     def __init__(self, tokens, top, experts, hidden, inter, device, width=None):
         routes = tokens * top
+        if not 1 <= experts <= MAX_EXPERTS:
+            raise ValueError(f"a call names 1 to {MAX_EXPERTS} experts, not {experts}")
         self.tokens, self.top, self.experts, self.routes = tokens, top, experts, routes
         self.width = width or width_for(routes, experts)
         if self.width not in (8, 32, 64):
             raise ValueError("items hold 8, 32 or 64 routes")
         self.capacity = math.ceil(routes / self.width) + min(experts, routes)
-        if self.capacity > 65535:
-            raise ValueError(f"{routes} routes make more than 65535 items: split the call")
+        if self.capacity > MAX_ITEMS:
+            raise ValueError(f"{routes} routes make more than {MAX_ITEMS} items: split the call")
         ints = dict(dtype=torch.int32, device=device)
         self.item_slot = torch.zeros(self.capacity, **ints)
         self.item_routes = torch.full((self.capacity, self.width), -1, **ints)

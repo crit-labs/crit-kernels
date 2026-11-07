@@ -51,6 +51,9 @@ struct Items {
 
 // The largest call the one-block plan takes; larger calls group their routes from a stable sort (enqueue_items).
 constexpr int kSmallPlanRoutes = 1024;
+// The experts a call may name, in either plan: a call's items (at most 65535, the launches' second grid dimension)
+// hold at least one per routed expert.
+constexpr int kMaxExperts = 65535;
 
 // Items from ids (int64 or int32, [routes]) for routes <= kSmallPlanRoutes: one block, no host synchronization.
 cudaError_t enqueue_plan(const long long* ids64, const int* ids32, int routes, int experts, const int* slots,

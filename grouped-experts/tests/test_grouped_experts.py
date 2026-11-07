@@ -505,3 +505,11 @@ def test_mxfp4_scale_bytes_0_and_255_decode_as_the_format_defines():
     ref = down @ h
     assert bool(ref.abs().max() > 0) and (out[0] - ref).abs().max() <= 5e-3 * ref.abs().max()
     assert bool(torch.isnan(out[1]).all())
+
+
+@pytest.mark.kernels_ci
+def test_one_expert_limit_for_both_plans():
+    for tokens in (1, 2048):   # the one-block plan and the sorted one
+        gx.Workspace(tokens, 1, gx.MAX_EXPERTS, 64, 64, dev)
+        with pytest.raises(ValueError, match="experts"):
+            gx.Workspace(tokens, 1, gx.MAX_EXPERTS + 1, 64, 64, dev)

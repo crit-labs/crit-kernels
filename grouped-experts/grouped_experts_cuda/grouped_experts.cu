@@ -942,7 +942,7 @@ bool valid(const Items& it) {
 
 cudaError_t enqueue_plan(const long long* ids64, const int* ids32, int routes, int experts, const int* slots,
                          const Items& items, cudaStream_t stream) {
-    if((!ids64 && !ids32) || routes < 0 || routes > kSmallPlanRoutes || experts < 1 || experts >= (1 << 22) - 1 ||
+    if((!ids64 && !ids32) || routes < 0 || routes > kSmallPlanRoutes || experts < 1 || experts > kMaxExperts ||
        !valid(items))
         return cudaErrorInvalidValue;
     int threads = 32;
@@ -953,7 +953,8 @@ cudaError_t enqueue_plan(const long long* ids64, const int* ids32, int routes, i
 
 cudaError_t enqueue_items(const long long* order, const int* counts, const int* starts, const int* item_end,
                           int experts, const int* slots, const Items& items, cudaStream_t stream) {
-    if(!order || !counts || !starts || !item_end || experts < 1 || !valid(items)) return cudaErrorInvalidValue;
+    if(!order || !counts || !starts || !item_end || experts < 1 || experts > kMaxExperts || !valid(items))
+        return cudaErrorInvalidValue;
     const long long n = static_cast<long long>(items.capacity) * items.width;
     if(n == 0) return cudaSuccess;
     items_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(order, counts, starts, item_end, experts,
