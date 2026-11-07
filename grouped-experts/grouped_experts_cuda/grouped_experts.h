@@ -4,7 +4,7 @@
 // An expert is one contiguous bundle (crit's experts:bundles layout): its gate/up matrix [2 * inter][hidden] (gate rows
 // first) and down matrix [hidden][inter] as the checkpoint stores them (row major), their scales and per-row factors.
 // A call's routes (ids [tokens][top]) are grouped by expert on the device into items of `width` routes (8 for decode
-// rows, 32 for prompt chunks), each item naming the slot of its expert's bundle in the store (slots [experts]: >= 0 a
+// rows, 32 or 64 for prompt chunks), each item naming the slot of its expert's bundle in the store (slots [experts]: >= 0 a
 // slot, -2 an expert another tier computes, -1 an expert not routed; a route to a negative slot is skipped).
 //
 // The arithmetic is one function of a route and its expert, whatever the item, the chunk or the rows beside it, so
@@ -45,7 +45,7 @@ struct Items {
     int* slot = nullptr;      // [capacity]
     int* routes = nullptr;    // [capacity][width]
     int* count = nullptr;     // [1]
-    int width = 8, capacity = 0;
+    int width = 8, capacity = 0;   // width 8, 32 or 64
 };
 
 // The largest call the one-block plan takes; larger calls group their routes from a stable sort (enqueue_items).
@@ -59,9 +59,13 @@ cudaError_t enqueue_plan(const long long* ids64, const int* ids32, int routes, i
 cudaError_t enqueue_items(const long long* order, const int* counts, const int* starts, const int* item_end,
                           int experts, const int* slots, const Items& items, cudaStream_t stream);
 // h [routes][inter] BF16: SwiGLU(gate, up) of every planned route (x [tokens][hidden] BF16 rows, route r reads token
-// r / top). a4: nvfp4 inputs quantized at each expert's input scale, h quantized at its down input scale.
+// r / top). a4: nvfp4 inputs quantized at each expert's input scale, h quantized at its down input scale; with items
+// of width 8 (decode) and a4, x is the routes' operands enqueue_a4_inputs made ([routes][hidden], top 1).
 cudaError_t enqueue_gate_up(const __nv_bfloat16* x, int top, const std::uint8_t* store, const Layout& layout, bool a4,
                             const Items& items, __nv_bfloat16* h, cudaStream_t stream);
+// The W4A4 gate/up operands of every planned route, out [routes][hidden] BF16, for decode items (width 8).
+cudaError_t enqueue_a4_inputs(const __nv_bfloat16* x, int top, const std::uint8_t* store, const Layout& layout,
+                              const Items& items, __nv_bfloat16* out, cudaStream_t stream);
 // y [routes][hidden] FP32: the down rows of every planned route, unweighted.
 cudaError_t enqueue_down(const __nv_bfloat16* h, const std::uint8_t* store, const Layout& layout, bool a4,
                          const Items& items, float* y, cudaStream_t stream);
@@ -70,6 +74,19 @@ cudaError_t enqueue_down(const __nv_bfloat16* h, const std::uint8_t* store, cons
 cudaError_t enqueue_combine(const float* y, const long long* ids64, const int* ids32, const float* weights,
                             const int* slots, int experts, int tokens, int top, int hidden, bool skip_negative,
                             float* out, cudaStream_t stream);
+// The declared arithmetic (crit's integer block order, host-expert-arithmetic's host_int.h, which crit's CPU expert
+// tier computes, so a route's bits are the same on either processor), nvfp4 W4A4 and int4 W4A8 bundles:
+// - inputs: each planned route's x row quantized at its expert's gate/up input scale (nvfp4: 2 x E2M1 per 16, scales
+//   decoded / global) or as INT8 per 32 (int4): values int8 [routes][hidden], scales [routes][hidden / block];
+// - rows: out [routes][rows] FP32 = the declared rows of the route's expert (gate_up: [2 * inter], else [hidden]);
+// - intermediate: SwiGLU (declared) of the gate/up rows, quantized at the down input scale (nvfp4) or INT8 per 32.
+cudaError_t enqueue_declared_inputs(const __nv_bfloat16* x, int top, const std::uint8_t* store, const Layout& layout,
+                                    const Items& items, std::int8_t* values, float* scales, cudaStream_t stream);
+cudaError_t enqueue_declared_rows(const std::int8_t* values, const float* scales, const std::uint8_t* store,
+                                  const Layout& layout, bool gate_up, const Items& items, float* out,
+                                  cudaStream_t stream);
+cudaError_t enqueue_declared_intermediate(const float* gate_up, const std::uint8_t* store, const Layout& layout,
+                                          const Items& items, std::int8_t* values, float* scales, cudaStream_t stream);
 // The declared NVFP4 activation quantizer (crit's host_int quantize_e2m1x2): x [rows][cols] FP32 -> values int8
 // (2 * e2m1) and scales FP32 [rows][cols / 16] (decoded / global).
 cudaError_t enqueue_quantize_e2m1x2(const float* x, int rows, int cols, float global, std::int8_t* values,

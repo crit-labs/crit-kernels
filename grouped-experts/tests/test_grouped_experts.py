@@ -193,7 +193,7 @@ def test_a_route_keeps_its_bits_whatever_shares_its_call(fmt, a4):
     ids, w = routes(T, top, experts.E, g)
     full = experts.rows(x, ids)
     valid = (ids.reshape(-1) >= 0).cpu()
-    for width in (8, 32):
+    for width in (8, 32, 64):
         for first, count in ((0, 1), (17, 1), (40, 7), (100, 200)):
             part = experts.rows(x[first:first + count].clone(), ids[first:first + count].clone(), width=width)
             sel = valid[first * top:(first + count) * top]
@@ -263,3 +263,159 @@ def test_the_quantizer_is_the_declared_one():
     signed, decoded = quantize_codes(torch.nan_to_num(x, nan=0.0), 37.5)
     assert torch.equal(values.cpu(), (2 * signed).to(torch.int8).reshape(x.shape))
     assert torch.equal(scales.cpu(), decoded / torch.tensor(37.5))
+
+
+# ------------------------------------------------------------------------------------- the declared arithmetic
+# An exact oracle of crit's integer block order (host-expert-arithmetic host_int.h, the CPU tier's): every FP32 step
+# rounded once, fmaf through exact rationals.
+
+from fractions import Fraction  # noqa: E402
+
+
+def f32(value):
+    if isinstance(value, Fraction):
+        return _round(value)
+    return float(torch.tensor(value, dtype=torch.float64).float())
+
+
+def _round(q):
+    if q == 0:
+        return 0.0
+    sign = -1.0 if q < 0 else 1.0
+    q = abs(q)
+    e = q.numerator.bit_length() - q.denominator.bit_length()
+    if Fraction(2) ** e > q:
+        e -= 1
+    e = max(e, -126)
+    scaled = q / Fraction(2) ** (e - 23)
+    whole, rest = divmod(scaled.numerator, scaled.denominator)
+    half = Fraction(rest, scaled.denominator)
+    if half > Fraction(1, 2) or (half == Fraction(1, 2) and whole % 2):
+        whole += 1
+    return sign * math.ldexp(whole, e - 23)
+
+
+def fma32(a, b, c):
+    return _round(Fraction(a) * Fraction(b) + Fraction(c))
+
+
+def add32(a, b):
+    return _round(Fraction(a) + Fraction(b))
+
+
+def mul32(a, b):
+    return _round(Fraction(a) * Fraction(b))
+
+
+def div32(a, b):
+    return _round(Fraction(a) / Fraction(b))
+
+
+def exp_declared(x):
+    x = 88.0 if x > 88.0 else -87.0 if x < -87.0 else x
+    n = float(round(mul32(x, 1.44269504)))   # rint: ties to even (Python's round)
+    r = fma32(n, f32(-0.693145752), x)
+    r = fma32(n, f32(-1.42860677e-06), r)
+    p = f32(1.98412698e-04)
+    for c in (1.38888889e-03, 8.33333333e-03, 4.16666667e-02, 1.66666667e-01, 0.5, 1.0, 1.0):
+        p = fma32(p, r, f32(c))
+    return mul32(p, math.ldexp(1.0, int(n)))
+
+
+def swiglu_declared(gate, up):
+    return mul32(div32(gate, add32(1.0, exp_declared(-gate))), up)
+
+
+def declared_row(weights, wscales, acts, ascales, ratio, post):
+    lanes = [0.0] * 16
+    for b in range(len(wscales)):
+        s = sum(int(w) * int(a) for w, a in zip(weights[16 * b:16 * b + 16], acts[16 * b:16 * b + 16]))
+        lanes[b % 16] = fma32(float(s), mul32(wscales[b], ascales[b // ratio]), lanes[b % 16])
+    w = 8
+    while w >= 1:
+        lanes = [add32(lanes[i], lanes[i + w]) if i < w else lanes[i] for i in range(16)]
+        w //= 2
+    return mul32(lanes[0], post)
+
+
+def quantize_int8(v, block=32):
+    out, scales = [], []
+    for b in range(len(v) // block):
+        seg = [f32(x) for x in v[block * b:block * b + block]]
+        d = div32(max(abs(x) for x in seg), 127.0)
+        scales.append(d)
+        for x in seg:
+            q = float(round(div32(x, d))) if d > 0 else 0.0
+            out.append(int(max(-127.0, min(127.0, q))))
+    return out, scales
+
+
+def declared_reference(experts, x, ids, fmt):
+    """y [routes][hidden] of the declared arithmetic, route by route."""
+    H, I = experts.H, experts.I
+    store = experts.store.cpu()
+    o, _ = offsets(fmt, H, I)
+    int4 = fmt == "int4"
+
+    def weights_of(e, name, rows, cols):
+        codes = store[e, o[name]:o[name] + rows * cols // 2].view(rows, cols // 2)
+        lo, hi = (codes & 15).long(), (codes >> 4).long()
+        table = [c if c < 8 else c - 16 for c in range(16)] if int4 else \
+            [2 * v for v in E2M1] + [-2 * v for v in E2M1]
+        vals = torch.tensor(table)[torch.stack([lo, hi], -1).reshape(rows, cols)]
+        sc = store[e, o[name + "_scale"]:o[name + "_scale"] + rows * cols // 16].view(rows, cols // 16)
+        wscale = sc.view(torch.float8_e4m3fn).float().tolist()
+        inv = store[e, o[name + "_inverse"]:o[name + "_inverse"] + 4 * rows].view(torch.float32).tolist()
+        post = [inv[n] if int4 else mul32(0.25, inv[n]) for n in range(rows)]
+        return vals.tolist(), wscale, post
+
+    y = {}
+    xs = x.float().cpu()
+    for t in range(ids.shape[0]):
+        for j in range(ids.shape[1]):
+            e = int(ids[t, j])
+            if e < 0:
+                continue
+            g_in, g_dn = experts.inputs[e]
+            if int4:
+                acts, ascales = quantize_int8(xs[t].tolist())
+            else:
+                signed, decoded = quantize_codes(xs[t:t + 1], f32(g_in))
+                acts = (2 * signed).reshape(-1).int().tolist()
+                ascales = (decoded / torch.tensor(f32(g_in))).reshape(-1).tolist()
+            gw, gs, gp = weights_of(e, "gate_up", 2 * I, H)
+            ratio = 2 if int4 else 1
+            gu = [declared_row(gw[n], gs[n], acts, ascales, ratio, gp[n]) for n in range(2 * I)]
+            h = [swiglu_declared(gu[k], gu[I + k]) for k in range(I)]
+            if int4:
+                hv, hsc = quantize_int8(h)
+            else:
+                signed, decoded = quantize_codes(torch.tensor([h], dtype=torch.float32), f32(g_dn))
+                hv = (2 * signed).reshape(-1).int().tolist()
+                hsc = (decoded / torch.tensor(f32(g_dn))).reshape(-1).tolist()
+            dw, dsc, dp = weights_of(e, "down", H, I)
+            y[t * ids.shape[1] + j] = [declared_row(dw[n], dsc[n], hv, hsc, ratio, dp[n]) for n in range(H)]
+    return y
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("fmt", ["nvfp4", "int4"])
+def test_the_declared_arithmetic_is_the_integer_block_order_bit_for_bit(fmt):
+    experts = Experts(fmt, E=3, H=128, I=64, seed=21)
+    g = torch.Generator().manual_seed(22)
+    x = torch.randn(3, experts.H, generator=g).bfloat16().to(dev)
+    ids, w = routes(3, 2, experts.E, g, holes=False)
+    ws = gx.Workspace(3, 2, experts.E, experts.H, experts.I, dev)
+    y = gx.route_outputs(x, ids, experts.store, None, experts.layout, ws, arithmetic="declared").clone()
+    expected = declared_reference(experts, x, ids.cpu(), fmt)
+    for route, row in expected.items():
+        assert y[route].cpu().tolist() == row, (fmt, route)
+    wide = gx.Workspace(3, 2, experts.E, experts.H, experts.I, dev, width=32)
+    again = gx.route_outputs(x, ids, experts.store, None, experts.layout, wide, arithmetic="declared")
+    assert torch.equal(again, y)
+    ref = experts.reference(x, ids.cpu(), w.cpu()) if fmt == "nvfp4" else None
+    if ref is not None:   # W4A4 against the FP64 block of the same quantized operands
+        out = gx.combine(y, ids, w, None, experts.E).double().cpu()
+        experts.a4 = True
+        ref = experts.reference(x, ids.cpu(), w.cpu())
+        assert (out - ref).abs().max() <= 3e-2 * ref.abs().max()

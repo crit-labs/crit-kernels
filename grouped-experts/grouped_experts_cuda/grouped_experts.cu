@@ -141,9 +141,11 @@ struct Raw {
     uint32_t s;
 };
 
-template <int F>
-constexpr int depth() {   // 64-k blocks of weights in flight per warp
-    return F == int(Format::bf16) ? 2 : (F == int(Format::fp8_channel) || F == int(Format::fp8_block)) ? 3 : 4;
+template <int F, int TILES>
+__host__ __device__ constexpr int depth() {   // 64-k blocks of weights in flight per warp (deeper with fewer rows)
+    return F == int(Format::bf16) ? (TILES == 1 ? 3 : 2)
+           : (F == int(Format::fp8_channel) || F == int(Format::fp8_block)) ? (TILES == 1 ? 4 : 3)
+           : (TILES == 1 ? 6 : 4);
 }
 
 // The lane's 16 weights k .. k + 15 of `row` (k a multiple of 16).
@@ -271,11 +273,13 @@ __device__ __forceinline__ void stage(const Pass& p, const int* routes, int rows
     }
 }
 
-// One block: item blockIdx.y, WARPS warps of 16 * TILES output rows each (gate/up: TILES 2, 16 inter rows, each MMA
-// tile 8 gate rows over the same 8 up rows so a lane holds both halves of its SwiGLU).
+// One block: item blockIdx.y, WARPS warps of TILES MMA row tiles each: down, 16 output rows a tile; gate/up, 8 inter
+// rows a tile, its 8 gate rows over the same 8 up rows, so a lane holds both halves of its SwiGLU. Which rows a warp
+// owns changes no output's MMA chain, so decode (TILES 1: more warps an expert) and prompt (TILES 2) agree bit for bit.
 template <int F, int NT, int TILES, int WARPS, bool GATEUP, bool A4>
 __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
-    constexpr int R = 8 * NT, ROWS = 2 * TILES, D = depth<F>();
+    constexpr int R = 8 * NT, ROWS = 2 * TILES, D = depth<F, TILES>();
+    static_assert(!(A4 && GATEUP && TILES == 1) || WARPS % 2 == 0, "W4A4 pairs warps for a 16-row block");
     constexpr bool kBlock = F == int(Format::fp8_block);
     extern __shared__ __align__(16) unsigned char smem[];
     bf16* tile = reinterpret_cast<bf16*>(smem);
@@ -295,7 +299,7 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
     const std::uint8_t* codes = bundle + (GATEUP ? L.gate_up : L.down);
     const std::uint8_t* scales = bundle + (GATEUP ? L.gate_up_scale : L.down_scale);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
-    const int r0 = (blockIdx.x * WARPS + warp) * 16 * (GATEUP ? 1 : TILES);
+    const int r0 = (blockIdx.x * WARPS + warp) * (GATEUP ? 8 : 16) * TILES;
     const bool live = r0 < M;
     int rows[ROWS];
 #pragma unroll
@@ -325,13 +329,31 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
                 for(int i = 0; i < 4; ++i) part[t][n][i] = 0.0f;
     }
     const int blocks = K / 64, width = p.chunk + kPad;
+    // Decode items (one n-tile) read their B fragments straight from global memory (the routes' rows of x or h, or
+    // the routes' W4A4 operands a pre-pass quantized): no staging, no barrier in the k loop; the same operands.
+    constexpr bool kDirect = NT == 1;
+    const bf16* brow = nullptr;
+    if constexpr(kDirect) {
+        const int r = routes[g];
+        brow = r >= 0 ? p.in + static_cast<long long>(r / p.in_div) * K + 16 * t4 : nullptr;
+    }
     Raw<F> ring[D][ROWS];
+    uint4 bring[kDirect ? D : 1][2];
     if(live) {
 #pragma unroll
         for(int d = 0; d < D; ++d)
-            if(d < blocks)
+            if(d < blocks) {
 #pragma unroll
                 for(int r = 0; r < ROWS; ++r) ring[d][r] = load_raw<F>(codes, scales, rows[r], K, 64 * d + 16 * t4);
+                if constexpr(kDirect) {
+                    if(brow) {
+                        bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d));
+                        bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d) + 1);
+                    } else {
+                        bring[d][0] = bring[d][1] = make_uint4(0u, 0u, 0u, 0u);
+                    }
+                }
+            }
     }
     for(int b0 = 0; b0 < blocks; b0 += D) {
 #pragma unroll
@@ -339,7 +361,7 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
             const int kb = b0 + d;
             if(kb >= blocks) break;
             const int k = 64 * kb, kk = k % p.chunk;
-            if(kk == 0) {
+            if(!kDirect && kk == 0) {
                 __syncthreads();
                 const int count = K - k < p.chunk ? K - k : p.chunk;
                 stage<A4 && GATEUP>(p, routes, 8 * active, K, k, count, g_in, tile);
@@ -349,16 +371,34 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
             uint32_t fr[ROWS][8];
 #pragma unroll
             for(int r = 0; r < ROWS; ++r) decode<F>(ring[d][r], fr[r]);
+            uint4 b_now[2];
+            if constexpr(kDirect) {
+                b_now[0] = bring[d][0];
+                b_now[1] = bring[d][1];
+            }
             if(kb + D < blocks) {
 #pragma unroll
                 for(int r = 0; r < ROWS; ++r) ring[d][r] = load_raw<F>(codes, scales, rows[r], K, 64 * (kb + D) + 16 * t4);
+                if constexpr(kDirect) {
+                    if(brow) {
+                        bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)));
+                        bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)) + 1);
+                    }
+                }
             }
 #pragma unroll
             for(int n = 0; n < NT; ++n) {
                 if(n >= active) break;
-                const uint4* bp = reinterpret_cast<const uint4*>(tile + (8 * n + g) * width + kk + 16 * t4);
-                const uint4 v0 = bp[0], v1 = bp[1];
-                const uint32_t bw[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+                uint4 v0, v1;
+                if constexpr(kDirect) {
+                    v0 = b_now[0];
+                    v1 = b_now[1];
+                } else {
+                    const uint4* bp = reinterpret_cast<const uint4*>(tile + (8 * n + g) * width + kk + 16 * t4);
+                    v0 = bp[0];
+                    v1 = bp[1];
+                }
+                const uint32_t bw[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};   // route 8n + g
 #pragma unroll
                 for(int t = 0; t < TILES; ++t)
 #pragma unroll
@@ -389,7 +429,7 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
             }
         }
     }
-    if(!live) return;
+    if(!live && !(A4 && GATEUP && TILES == 1)) return;   // a W4A4 pair meets at its barriers (every gate/up warp lives)
     if constexpr(GATEUP) {
         // C fragment: c0, c1 = gate row rows[2t] for routes 2 t4, 2 t4 + 1; c2, c3 = up row rows[2t + 1], same routes.
         bf16* h = reinterpret_cast<bf16*>(p.out);
@@ -409,18 +449,25 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
 #pragma unroll
                 for(int t = 0; t < TILES; ++t)
                     hv[t] = swiglu_declared(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]));
-                if constexpr(A4) {   // the 16 inter rows r0 .. r0 + 15 of this route: one block of the down's input
+                if constexpr(A4) {   // a 16-row block of inter rows of this route: one block of the down's input
                     float amax = 0.0f;
 #pragma unroll
                     for(int t = 0; t < TILES; ++t) amax = fmaxf(amax, fabsf(hv[t]));
 #pragma unroll
                     for(int o = 4; o < 32; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                    if constexpr(TILES == 1) {   // the block's other 8 rows are the paired warp's (warp ^ 1)
+                        __shared__ float pair[WARPS][8];
+                        __syncthreads();
+                        if(g == 0) pair[warp][2 * t4 + c] = amax;
+                        __syncthreads();
+                        amax = fmaxf(amax, pair[warp ^ 1][2 * t4 + c]);
+                    }
                     const float decoded = block_scale(amax, g_dn);
 #pragma unroll
                     for(int t = 0; t < TILES; ++t) hv[t] = e2m1_operand(hv[t], g_dn, decoded);
                 }
                 const int r = routes[8 * n + 2 * t4 + c];
-                if(r >= 0) {
+                if(r >= 0 && live) {
 #pragma unroll
                     for(int t = 0; t < TILES; ++t)
                         h[static_cast<long long>(r) * I + r0 + 8 * t + g] = __float2bfloat16_rn(hv[t]);
@@ -581,24 +628,238 @@ __global__ void quantize_kernel(const float* x, int rows, int cols, float g, std
     scales[i] = __fdiv_rn(decoded, g);
 }
 
+// Item u's routes' W4A4 gate/up operands for the direct decode pass: x quantized per route at its expert's input
+// scale, e2m1 x decoded scale (exact BF16), [routes][hidden]; the function staging computes for prompt items.
+__global__ void a4_inputs_kernel(const bf16* x, int top, const std::uint8_t* store, Layout L, Items it, bf16* out) {
+    const int u = blockIdx.x;
+    if(u >= *it.count) return;
+    const int H = L.hidden, blocks = H / 16;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x, j = i / blocks, b = i % blocks;
+    if(j >= it.width) return;
+    const int r = it.routes[static_cast<long long>(u) * it.width + j];
+    if(r < 0) return;
+    const std::uint8_t* bundle = store + static_cast<long long>(it.slot[u]) * L.bytes;
+    const float g = reinterpret_cast<const float*>(bundle + L.input)[0];
+    const uint4* src = reinterpret_cast<const uint4*>(x + static_cast<long long>(r / top) * H + 16 * b);
+    const uint4 a = __ldg(src), c = __ldg(src + 1);
+    const uint32_t words[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
+    float v[16], amax = 0.0f;
+#pragma unroll
+    for(int q = 0; q < 8; ++q) {
+        const float2 f = __bfloat1622float2(b2(words[q]));
+        v[2 * q] = f.x;
+        v[2 * q + 1] = f.y;
+        amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+    }
+    const float decoded = block_scale(amax, g);
+    uint4 o[2];
+    uint32_t* w = reinterpret_cast<uint32_t*>(o);
+#pragma unroll
+    for(int q = 0; q < 8; ++q)
+        w[q] = u32(__floats2bfloat162_rn(e2m1_operand(v[2 * q], g, decoded), e2m1_operand(v[2 * q + 1], g, decoded)));
+    uint4* dst = reinterpret_cast<uint4*>(out + static_cast<long long>(r) * H + 16 * b);
+    dst[0] = o[0];
+    dst[1] = o[1];
+}
+
+// ------------------------------------------------------------------------------------------- the declared order
+// crit's integer block order (host-expert-arithmetic's host_int.h, which crit's CPU expert tier computes): 4-bit
+// weights as integers (2 x E2M1 or INT4) against activations quantized per block (2 x E2M1 per 16 at the expert's
+// input scale for nvfp4, INT8 per 32 for int4); each 16-block's dot exact in int32 (dp4a); block b to lane b % 16,
+// lane = fmaf(float(dot), fmul(weight scale, activation scale), lane), blocks ascending; the 16 lanes by the halving
+// tree; times post[row] (0.25 / global scale for nvfp4, 1 / global scale for int4). SwiGLU and the intermediate's
+// quantization are the declared ones. The same bits as the CPU tier's rows, whatever kernel or item computes a route.
+
+__device__ __forceinline__ int weight_value(unsigned code, bool int4) {
+    if(int4) return int(code << 28) >> 28;
+    const int magnitude = int(__byte_perm(0x03020100u, 0x0c080604u, code & 7u) & 0xffu);
+    return (code & 8u) ? -magnitude : magnitude;
+}
+// Four consecutive codes (16 bits, element 4i first) as packed int8 values.
+__device__ __forceinline__ int four_weights(unsigned pair, bool int4) {
+    unsigned packed = 0;
+#pragma unroll
+    for(int i = 0; i < 4; ++i) packed |= (unsigned(weight_value((pair >> (4 * i)) & 15u, int4)) & 0xffu) << (8 * i);
+    return int(packed);
+}
+
+constexpr int kDeclaredThreads = 128;
+
+// Item u's routes' inputs, quantized at the route's expert's gate/up input scale: values int8 [routes][hidden],
+// scales FP32 [routes][hidden / block].
+template <bool INT4>
+__global__ void declared_inputs_kernel(const bf16* x, int top, const std::uint8_t* store, Layout L, Items it,
+                                       std::int8_t* values, float* scales) {
+    constexpr int B = INT4 ? 32 : 16;
+    const int u = blockIdx.x;
+    if(u >= *it.count) return;
+    const int H = L.hidden, blocks = H / B;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x, j = i / blocks, b = i % blocks;
+    if(j >= it.width) return;
+    const int r = it.routes[static_cast<long long>(u) * it.width + j];
+    if(r < 0) return;
+    const bf16* v = x + static_cast<long long>(r / top) * H + b * B;
+    float f[B], amax = 0.0f;
+#pragma unroll
+    for(int k = 0; k < B; ++k) {
+        f[k] = __bfloat162float(v[k]);
+        amax = fmaxf(amax, fabsf(f[k]));
+    }
+    std::int8_t* out = values + static_cast<long long>(r) * H + b * B;
+    if constexpr(INT4) {
+        const float d = __fdiv_rn(amax, 127.0f);
+#pragma unroll
+        for(int k = 0; k < B; ++k) {
+            float q = d > 0.0f ? rintf(__fdiv_rn(f[k], d)) : 0.0f;
+            q = q > 127.0f ? 127.0f : q < -127.0f ? -127.0f : q;
+            out[k] = static_cast<std::int8_t>(q);
+        }
+        scales[static_cast<long long>(r) * blocks + b] = d;
+    } else {
+        const std::uint8_t* bundle = store + static_cast<long long>(it.slot[u]) * L.bytes;
+        const float g = reinterpret_cast<const float*>(bundle + L.input)[0];
+        const float decoded = block_scale(amax, g);
+#pragma unroll
+        for(int k = 0; k < B; ++k) {
+            int value = 0;
+            if(decoded > 0.0f) {
+                const float q = __fdiv_rn(__fmul_rn(f[k], g), decoded);
+                const int code = e2m1_code(fabsf(q));
+                value = int(2.0f * e2m1_magnitude(code));
+                if(q < 0.0f && code) value = -value;
+            }
+            out[k] = static_cast<std::int8_t>(value);
+        }
+        scales[static_cast<long long>(r) * blocks + b] = __fdiv_rn(decoded, g);
+    }
+}
+
+// The declared rows of item u's expert: a half-warp per output row, the item's routes 8 at a time.
+template <bool INT4, bool GATEUP>
+__global__ void __launch_bounds__(256) declared_rows_kernel(const std::int8_t* values, const float* ascales,
+                                                            const std::uint8_t* store, Layout L, Items it, float* out) {
+    __shared__ float scale_of[256];
+    __shared__ int routes[64];
+    const int u = blockIdx.y;
+    if(u >= *it.count) return;
+    for(int i = threadIdx.x; i < 256; i += blockDim.x) scale_of[i] = e4m3_value(static_cast<uint32_t>(i));
+    for(int j = threadIdx.x; j < it.width; j += blockDim.x) routes[j] = it.routes[static_cast<long long>(u) * it.width + j];
+    __syncthreads();
+    const int H = L.hidden, I = L.inter;
+    const int K = GATEUP ? H : I, M = GATEUP ? 2 * I : H;
+    const int row = blockIdx.x * 16 + static_cast<int>(threadIdx.x) / 16;
+    if(row >= M) return;   // the whole half-warp leaves together
+    const unsigned lane = threadIdx.x % 16u, group = 0xffffu << (threadIdx.x % 32u & 16u);
+    const std::uint8_t* bundle = store + static_cast<long long>(it.slot[u]) * L.bytes;
+    const std::uint8_t* codes = bundle + (GATEUP ? L.gate_up : L.down) + static_cast<long long>(row) * (K / 2);
+    const std::uint8_t* scales = bundle + (GATEUP ? L.gate_up_scale : L.down_scale) + static_cast<long long>(row) * (K / 16);
+    const float inverse = reinterpret_cast<const float*>(bundle + (GATEUP ? L.gate_up_inverse : L.down_inverse))[row];
+    const float post = INT4 ? inverse : __fmul_rn(0.25f, inverse);
+    constexpr int ratio = INT4 ? 2 : 1;
+    const int blocks = K / 16, lds = K / (16 * ratio);
+    for(int t0 = 0; t0 < it.width && routes[t0] >= 0; t0 += 8) {
+        int r[8];
+#pragma unroll
+        for(int t = 0; t < 8; ++t) r[t] = t0 + t < it.width ? routes[t0 + t] : -1;
+        float acc[8];
+#pragma unroll
+        for(int t = 0; t < 8; ++t) acc[t] = 0.0f;
+        for(int b = static_cast<int>(lane); b < blocks; b += 16) {
+            const uint2 q = __ldg(reinterpret_cast<const uint2*>(codes + 8 * b));
+            const int w0 = four_weights(q.x & 0xffffu, INT4), w1 = four_weights(q.x >> 16, INT4);
+            const int w2 = four_weights(q.y & 0xffffu, INT4), w3 = four_weights(q.y >> 16, INT4);
+            const float ws = scale_of[scales[b]];
+#pragma unroll
+            for(int t = 0; t < 8; ++t) {
+                if(r[t] < 0) continue;
+                const int4 x = __ldg(reinterpret_cast<const int4*>(values + static_cast<long long>(r[t]) * K + 16 * b));
+                int sum = __dp4a(w0, x.x, 0);
+                sum = __dp4a(w1, x.y, sum);
+                sum = __dp4a(w2, x.z, sum);
+                sum = __dp4a(w3, x.w, sum);
+                const float as = ascales[static_cast<long long>(r[t]) * lds + b / ratio];
+                acc[t] = __fmaf_rn(float(sum), __fmul_rn(ws, as), acc[t]);
+            }
+        }
+#pragma unroll
+        for(int t = 0; t < 8; ++t) {
+            float v = acc[t];
+#pragma unroll
+            for(int w = 8; w >= 1; w /= 2) v = __fadd_rn(v, __shfl_down_sync(group, v, w, 16));
+            if(lane == 0 && r[t] >= 0) out[static_cast<long long>(r[t]) * M + row] = __fmul_rn(v, post);
+        }
+    }
+}
+
+// The declared intermediate of item u's routes: SwiGLU of their gate/up rows, quantized at the expert's down input
+// scale (nvfp4, 2 x E2M1 per 16) or as INT8 per 32 (int4): values int8 [routes][inter], scales [routes][inter / block].
+template <bool INT4>
+__global__ void declared_intermediate_kernel(const float* gate_up, const std::uint8_t* store, Layout L, Items it,
+                                             std::int8_t* values, float* scales) {
+    constexpr int B = INT4 ? 32 : 16;
+    const int u = blockIdx.x;
+    if(u >= *it.count) return;
+    const int I = L.inter, blocks = I / B;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x, j = i / blocks, b = i % blocks;
+    if(j >= it.width) return;
+    const int r = it.routes[static_cast<long long>(u) * it.width + j];
+    if(r < 0) return;
+    const float* gu = gate_up + static_cast<long long>(r) * 2 * I + b * B;
+    float h[B], amax = 0.0f;
+#pragma unroll
+    for(int k = 0; k < B; ++k) {
+        h[k] = swiglu_declared(gu[k], gu[I + k]);
+        amax = fmaxf(amax, fabsf(h[k]));
+    }
+    std::int8_t* out = values + static_cast<long long>(r) * I + b * B;
+    if constexpr(INT4) {
+        const float d = __fdiv_rn(amax, 127.0f);
+#pragma unroll
+        for(int k = 0; k < B; ++k) {
+            float q = d > 0.0f ? rintf(__fdiv_rn(h[k], d)) : 0.0f;
+            q = q > 127.0f ? 127.0f : q < -127.0f ? -127.0f : q;
+            out[k] = static_cast<std::int8_t>(q);
+        }
+        scales[static_cast<long long>(r) * blocks + b] = d;
+    } else {
+        const std::uint8_t* bundle = store + static_cast<long long>(it.slot[u]) * L.bytes;
+        const float g = reinterpret_cast<const float*>(bundle + L.input)[1];
+        const float decoded = block_scale(amax, g);
+#pragma unroll
+        for(int k = 0; k < B; ++k) {
+            int value = 0;
+            if(decoded > 0.0f) {
+                const float q = __fdiv_rn(__fmul_rn(h[k], g), decoded);
+                const int code = e2m1_code(fabsf(q));
+                value = int(2.0f * e2m1_magnitude(code));
+                if(q < 0.0f && code) value = -value;
+            }
+            out[k] = static_cast<std::int8_t>(value);
+        }
+        scales[static_cast<long long>(r) * blocks + b] = __fdiv_rn(decoded, g);
+    }
+}
+
 // ----------------------------------------------------------------------------------------------- launches
 
 constexpr int kWarps = 4;
 
-int chunk_for(int width, int K) {   // k values staged per pass: a decode item stages all of K when it fits 48 KiB
-    if(width == 8) return 8 * (K + kPad) * 2 <= 48 * 1024 ? K : 1024;
+int chunk_for(int width, int K) {   // k values staged per pass (a multiple of 64): a decode item stages up to 1024
+    if(width == 8) return K <= 1024 ? K : 1024;
     return 256;
 }
 
 template <int F, int NT, bool GATEUP, bool A4>
 cudaError_t launch(const Pass& base, const Items& items, cudaStream_t stream) {
-    constexpr int TILES = GATEUP ? 2 : (NT == 1 ? 1 : 2);
+    // Decode items (NT 1): more warps an expert; 32-route items: two tiles share each B fragment; 64-route items: one
+    // tile, the weights decoded once for every route of the expert.
+    constexpr int TILES = NT == 4 ? 2 : 1;
     Pass p = base;
     const int K = GATEUP ? p.layout.hidden : p.layout.inter, M = GATEUP ? p.layout.inter : p.layout.hidden;
     p.chunk = chunk_for(items.width, K);
-    const int rows_per_block = kWarps * 16 * (GATEUP ? 1 : TILES);
+    const int rows_per_block = kWarps * (GATEUP ? 8 : 16) * TILES;
     const dim3 grid((M + rows_per_block - 1) / rows_per_block, items.capacity);
-    const size_t bytes = static_cast<size_t>(8 * NT) * (p.chunk + kPad) * sizeof(bf16);
+    const size_t bytes = NT == 1 ? 0 : static_cast<size_t>(8 * NT) * (p.chunk + kPad) * sizeof(bf16);
     expert_kernel<F, NT, TILES, kWarps, GATEUP, A4><<<grid, kWarps * 32, bytes, stream>>>(p);
     return cudaGetLastError();
 }
@@ -607,13 +868,16 @@ template <bool GATEUP>
 cudaError_t dispatch(const Pass& p, bool a4, const Items& items, cudaStream_t stream) {
     const int f = static_cast<int>(p.layout.format);
     if(a4 && p.layout.format != Format::nvfp4) return cudaErrorInvalidValue;
-    const bool wide = items.width == 32;
-    if(items.width != 8 && !wide) return cudaErrorInvalidValue;
-#define CRIT_GX_CASE(FMT)                                                                                          \
-    case int(FMT):                                                                                                 \
-        return wide ? launch<int(FMT), 4, GATEUP, false>(p, items, stream) : launch<int(FMT), 1, GATEUP, false>(p, items, stream);
-    if(a4) return wide ? launch<int(Format::nvfp4), 4, GATEUP, true>(p, items, stream)
-                       : launch<int(Format::nvfp4), 1, GATEUP, true>(p, items, stream);
+    const int w = items.width;
+    if(w != 8 && w != 32 && w != 64) return cudaErrorInvalidValue;
+#define CRIT_GX_CASE(FMT)                                                    \
+    case int(FMT):                                                           \
+        return w == 64 ? launch<int(FMT), 8, GATEUP, false>(p, items, stream)  \
+             : w == 32 ? launch<int(FMT), 4, GATEUP, false>(p, items, stream)  \
+                       : launch<int(FMT), 1, GATEUP, false>(p, items, stream);
+    if(a4) return w == 64 ? launch<int(Format::nvfp4), 8, GATEUP, true>(p, items, stream)
+                : w == 32 ? launch<int(Format::nvfp4), 4, GATEUP, true>(p, items, stream)
+                          : launch<int(Format::nvfp4), 1, GATEUP, true>(p, items, stream);
     switch(f) {
         CRIT_GX_CASE(Format::bf16)
         CRIT_GX_CASE(Format::fp8_channel)
@@ -632,7 +896,7 @@ bool valid(const Layout& L) {
            L.inter % 64 == 0 && L.gate_up >= 0 && L.down >= 0;
 }
 bool valid(const Items& it) {
-    return it.slot && it.routes && it.count && (it.width == 8 || it.width == 32) && it.capacity >= 0;
+    return it.slot && it.routes && it.count && (it.width == 8 || it.width == 32 || it.width == 64) && it.capacity >= 0;
 }
 
 }  // namespace
@@ -683,6 +947,63 @@ cudaError_t enqueue_combine(const float* y, const long long* ids64, const int* i
     if(tokens == 0) return cudaSuccess;
     const dim3 grid((hidden / 4 + 127) / 128, tokens);
     combine_kernel<<<grid, 128, 0, stream>>>(y, ids64, ids32, weights, slots, experts, top, hidden, skip_negative, out);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_a4_inputs(const bf16* x, int top, const std::uint8_t* store, const Layout& layout,
+                              const Items& items, bf16* out, cudaStream_t stream) {
+    if(!x || top < 1 || !store || !out || !valid(layout) || !valid(items) || layout.format != Format::nvfp4 ||
+       layout.input < 0)
+        return cudaErrorInvalidValue;
+    if(items.capacity == 0) return cudaSuccess;
+    const int per = items.width * (layout.hidden / 16);
+    const dim3 grid(items.capacity, (per + kDeclaredThreads - 1) / kDeclaredThreads);
+    a4_inputs_kernel<<<grid, kDeclaredThreads, 0, stream>>>(x, top, store, layout, items, out);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_declared_inputs(const bf16* x, int top, const std::uint8_t* store, const Layout& layout,
+                                    const Items& items, std::int8_t* values, float* scales, cudaStream_t stream) {
+    const bool int4 = layout.format == Format::int4;
+    if(!x || top < 1 || !store || !values || !scales || !valid(layout) || !valid(items) ||
+       (!int4 && (layout.format != Format::nvfp4 || layout.input < 0)))
+        return cudaErrorInvalidValue;
+    if(items.capacity == 0) return cudaSuccess;
+    const int per = items.width * (layout.hidden / (int4 ? 32 : 16));
+    const dim3 grid(items.capacity, (per + kDeclaredThreads - 1) / kDeclaredThreads);
+    if(int4) declared_inputs_kernel<true><<<grid, kDeclaredThreads, 0, stream>>>(x, top, store, layout, items, values, scales);
+    else declared_inputs_kernel<false><<<grid, kDeclaredThreads, 0, stream>>>(x, top, store, layout, items, values, scales);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_declared_rows(const std::int8_t* values, const float* scales, const std::uint8_t* store,
+                                  const Layout& layout, bool gate_up, const Items& items, float* out,
+                                  cudaStream_t stream) {
+    const bool int4 = layout.format == Format::int4;
+    if(!values || !scales || !store || !out || !valid(layout) || !valid(items) ||
+       (!int4 && layout.format != Format::nvfp4))
+        return cudaErrorInvalidValue;
+    if(items.capacity == 0) return cudaSuccess;
+    const int rows = gate_up ? 2 * layout.inter : layout.hidden;
+    const dim3 grid((rows + 15) / 16, items.capacity);
+    if(int4 && gate_up) declared_rows_kernel<true, true><<<grid, 256, 0, stream>>>(values, scales, store, layout, items, out);
+    else if(int4) declared_rows_kernel<true, false><<<grid, 256, 0, stream>>>(values, scales, store, layout, items, out);
+    else if(gate_up) declared_rows_kernel<false, true><<<grid, 256, 0, stream>>>(values, scales, store, layout, items, out);
+    else declared_rows_kernel<false, false><<<grid, 256, 0, stream>>>(values, scales, store, layout, items, out);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_declared_intermediate(const float* gate_up, const std::uint8_t* store, const Layout& layout,
+                                          const Items& items, std::int8_t* values, float* scales, cudaStream_t stream) {
+    const bool int4 = layout.format == Format::int4;
+    if(!gate_up || !store || !values || !scales || !valid(layout) || !valid(items) ||
+       (!int4 && (layout.format != Format::nvfp4 || layout.input < 0)))
+        return cudaErrorInvalidValue;
+    if(items.capacity == 0) return cudaSuccess;
+    const int per = items.width * (layout.inter / (int4 ? 32 : 16));
+    const dim3 grid(items.capacity, (per + kDeclaredThreads - 1) / kDeclaredThreads);
+    if(int4) declared_intermediate_kernel<true><<<grid, kDeclaredThreads, 0, stream>>>(gate_up, store, layout, items, values, scales);
+    else declared_intermediate_kernel<false><<<grid, kDeclaredThreads, 0, stream>>>(gate_up, store, layout, items, values, scales);
     return cudaGetLastError();
 }
 

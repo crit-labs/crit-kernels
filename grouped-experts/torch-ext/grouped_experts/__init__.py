@@ -21,7 +21,7 @@ import torch
 
 from ._ops import ops
 
-__all__ = ["FORMATS", "SMALL_PLAN", "Workspace", "combine", "forward", "quantize_e2m1x2", "route_outputs",
+__all__ = ["ARITHMETICS", "FORMATS", "SMALL_PLAN", "Workspace", "combine", "forward", "quantize_e2m1x2", "route_outputs",
            "width_for"]
 
 FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5}
@@ -29,8 +29,9 @@ SMALL_PLAN = 1024   # routes the one-block plan takes; larger calls group their 
 
 
 def width_for(routes, experts):
-    """Routes per item: 32 once a call averages 8 or more routes per expert (prompt chunks), else 8 (decode rows)."""
-    return 32 if routes >= 8 * experts else 8
+    """Routes per item: 64 once a call averages 24 or more routes per expert, 32 from 8, else 8 (decode rows). The width
+    changes the speed only, never a route's bits."""
+    return 64 if routes >= 24 * experts else 32 if routes >= 8 * experts else 8
 
 
 class Workspace:
@@ -42,8 +43,8 @@ class Workspace:
         routes = tokens * top
         self.tokens, self.top, self.experts, self.routes = tokens, top, experts, routes
         self.width = width or width_for(routes, experts)
-        if self.width not in (8, 32):
-            raise ValueError("items hold 8 or 32 routes")
+        if self.width not in (8, 32, 64):
+            raise ValueError("items hold 8, 32 or 64 routes")
         self.capacity = math.ceil(routes / self.width) + min(experts, routes)
         if self.capacity > 65535:
             raise ValueError(f"{routes} routes make more than 65535 items: split the call")
@@ -54,6 +55,19 @@ class Workspace:
         self.h = torch.empty(routes, inter, dtype=torch.bfloat16, device=device)
         self.y = torch.zeros(routes, hidden, dtype=torch.float32, device=device)
         self.ones = torch.ones(routes, **ints) if routes > SMALL_PLAN else None
+        self.hidden, self.inter, self.device, self._declared, self.xa = hidden, inter, device, None, None
+
+    def declared(self, layout):
+        """The declared arithmetic's buffers (made at its first call): quantized inputs and intermediate, gate/up rows."""
+        if self._declared is None:
+            block = 32 if layout[0] == FORMATS["int4"] else 16
+            n, H, I, dev = self.routes, self.hidden, self.inter, self.device
+            self._declared = {"x": torch.zeros(n, H, dtype=torch.int8, device=dev),
+                              "xs": torch.zeros(n, H // block, dtype=torch.float32, device=dev),
+                              "gu": torch.zeros(n, 2 * I, dtype=torch.float32, device=dev),
+                              "h": torch.zeros(n, I, dtype=torch.int8, device=dev),
+                              "hs": torch.zeros(n, I // block, dtype=torch.float32, device=dev)}
+        return self._declared
 
 
 def _plan(ids, slots, ws):
@@ -75,15 +89,36 @@ def _plan(ids, slots, ws):
     ops.items(order, counts, starts, item_end, slots, experts, ws.item_slot, ws.item_routes, ws.item_count)
 
 
-def route_outputs(x, ids, store, slots, layout, ws, a4=False):
+ARITHMETICS = ("tensor", "declared")
+
+
+def route_outputs(x, ids, store, slots, layout, ws, a4=False, arithmetic="tensor"):
     """Each planned route's unweighted output row, y [tokens * top][hidden] FP32 (ws.y; rows of skipped routes keep
     what they held). x [tokens][hidden] BF16 contiguous; ids [tokens][top]; store uint8 [slots][bytes]; slots int32
-    [experts] or None (expert e in slot e); a4: nvfp4 W4A4 at the bundles' input scales."""
+    [experts] or None (expert e in slot e); a4: nvfp4 W4A4 at the bundles' input scales. arithmetic: "tensor" (BF16
+    tensor cores, every format) or "declared" (crit's integer block order, the CPU tier's bits: nvfp4 W4A4, int4
+    W4A8)."""
     if ids.shape != (ws.tokens, ws.top):
         raise ValueError(f"the workspace takes ids [{ws.tokens}][{ws.top}], not {list(ids.shape)}")
+    if arithmetic not in ARITHMETICS:
+        raise ValueError(f"arithmetic is {' or '.join(ARITHMETICS)}, not {arithmetic!r}")
     _plan(ids, slots, ws)
-    ops.gate_up(x, ws.top, store, list(layout), bool(a4), ws.item_slot, ws.item_routes, ws.item_count, ws.h)
-    ops.down(ws.h, store, list(layout), bool(a4), ws.item_slot, ws.item_routes, ws.item_count, ws.y)
+    items = (ws.item_slot, ws.item_routes, ws.item_count)
+    if arithmetic == "declared":
+        d = ws.declared(layout)
+        ops.declared_inputs(x, ws.top, store, list(layout), *items, d["x"], d["xs"])
+        ops.declared_rows(d["x"], d["xs"], store, list(layout), True, *items, d["gu"])
+        ops.declared_intermediate(d["gu"], store, list(layout), *items, d["h"], d["hs"])
+        ops.declared_rows(d["h"], d["hs"], store, list(layout), False, *items, ws.y)
+        return ws.y
+    if a4 and ws.width == 8:   # decode items read their W4A4 operands, quantized once per route
+        if ws.xa is None:
+            ws.xa = torch.zeros(ws.routes, ws.hidden, dtype=torch.bfloat16, device=ws.device)
+        ops.a4_inputs(x, ws.top, store, list(layout), *items, ws.xa)
+        ops.gate_up(ws.xa, 1, store, list(layout), True, *items, ws.h)
+    else:
+        ops.gate_up(x, ws.top, store, list(layout), bool(a4), *items, ws.h)
+    ops.down(ws.h, store, list(layout), bool(a4), *items, ws.y)
     return ws.y
 
 
@@ -96,9 +131,9 @@ def combine(y, ids, weights, slots, experts, skip_negative=True, out=None):
     return out
 
 
-def forward(x, ids, weights, store, slots, layout, ws, a4=False, out=None):
+def forward(x, ids, weights, store, slots, layout, ws, a4=False, out=None, arithmetic="tensor"):
     """The routed SwiGLU block: out [tokens][hidden] FP32, routes to negative slots skipped."""
-    y = route_outputs(x, ids, store, slots, layout, ws, a4)
+    y = route_outputs(x, ids, store, slots, layout, ws, a4, arithmetic)
     return combine(y, ids, weights, slots, ws.experts, True, out)
 
 

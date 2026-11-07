@@ -13,7 +13,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "Tensor! y) -> ()");
   ops.def("combine(Tensor y, Tensor ids, Tensor weights, Tensor? slots, int experts, bool skip_negative, Tensor! out) -> ()");
   ops.def("quantize_e2m1x2(Tensor x, float g, Tensor! values, Tensor! scales) -> ()");
+  ops.def("a4_inputs(Tensor x, int top, Tensor store, int[] layout, Tensor item_slot, Tensor item_routes, "
+          "Tensor item_count, Tensor! out) -> ()");
+  ops.def("declared_inputs(Tensor x, int top, Tensor store, int[] layout, Tensor item_slot, Tensor item_routes, "
+          "Tensor item_count, Tensor! values, Tensor! scales) -> ()");
+  ops.def("declared_rows(Tensor values, Tensor scales, Tensor store, int[] layout, bool gate_up, Tensor item_slot, "
+          "Tensor item_routes, Tensor item_count, Tensor! out) -> ()");
+  ops.def("declared_intermediate(Tensor gate_up, Tensor store, int[] layout, Tensor item_slot, Tensor item_routes, "
+          "Tensor item_count, Tensor! values, Tensor! scales) -> ()");
 #if defined(CUDA_KERNEL)
+  ops.impl("a4_inputs", torch::kCUDA, &a4_inputs);
+  ops.impl("declared_inputs", torch::kCUDA, &declared_inputs);
+  ops.impl("declared_rows", torch::kCUDA, &declared_rows);
+  ops.impl("declared_intermediate", torch::kCUDA, &declared_intermediate);
   ops.impl("plan", torch::kCUDA, &plan);
   ops.impl("items", torch::kCUDA, &items);
   ops.impl("gate_up", torch::kCUDA, &gate_up);

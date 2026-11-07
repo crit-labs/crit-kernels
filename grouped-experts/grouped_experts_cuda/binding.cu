@@ -156,3 +156,80 @@ void quantize_e2m1x2(const torch::Tensor& x, double global, torch::Tensor& value
                                    at::cuda::getCurrentCUDAStream()),
        "quantize_e2m1x2");
 }
+
+void a4_inputs(const torch::Tensor& x, int64_t top, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+               const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+               torch::Tensor& out) {
+    const c10::cuda::CUDAGuard guard(x.device());
+    const gx::Layout L = layout_of(layout);
+    typed(x, "x", torch::kBFloat16);
+    typed(out, "out", torch::kBFloat16);
+    store_of(store, L);
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == L.hidden && out.dim() == 2 && out.size(1) == L.hidden &&
+                    out.size(0) >= x.size(0) * top,
+                "x [tokens][hidden], out [routes][hidden]");
+    ok(gx::enqueue_a4_inputs(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), static_cast<int>(top),
+                             store.data_ptr<uint8_t>(), L, items_of(item_slot, item_routes, item_count),
+                             reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), at::cuda::getCurrentCUDAStream()),
+       "a4_inputs");
+}
+
+namespace {
+int block_of(const gx::Layout& L) { return L.format == gx::Format::int4 ? 32 : 16; }
+}  // namespace
+
+void declared_inputs(const torch::Tensor& x, int64_t top, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+                     const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+                     torch::Tensor& values, torch::Tensor& scales) {
+    const c10::cuda::CUDAGuard guard(x.device());
+    const gx::Layout L = layout_of(layout);
+    typed(x, "x", torch::kBFloat16);
+    typed(values, "values", torch::kInt8);
+    typed(scales, "scales", torch::kFloat32);
+    store_of(store, L);
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == L.hidden, "x is [tokens][hidden]");
+    TORCH_CHECK(values.dim() == 2 && values.size(1) == L.hidden && values.size(0) >= x.size(0) * top &&
+                    scales.size(0) == values.size(0) && scales.size(1) * block_of(L) == L.hidden,
+                "values [routes][hidden], scales [routes][hidden / block]");
+    ok(gx::enqueue_declared_inputs(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), static_cast<int>(top),
+                                   store.data_ptr<uint8_t>(), L, items_of(item_slot, item_routes, item_count),
+                                   values.data_ptr<int8_t>(), scales.data_ptr<float>(), at::cuda::getCurrentCUDAStream()),
+       "declared_inputs");
+}
+
+void declared_rows(const torch::Tensor& values, const torch::Tensor& scales, const torch::Tensor& store,
+                   c10::ArrayRef<int64_t> layout, bool gate_up, const torch::Tensor& item_slot,
+                   const torch::Tensor& item_routes, const torch::Tensor& item_count, torch::Tensor& out) {
+    const c10::cuda::CUDAGuard guard(values.device());
+    const gx::Layout L = layout_of(layout);
+    typed(values, "values", torch::kInt8);
+    typed(scales, "scales", torch::kFloat32);
+    typed(out, "out", torch::kFloat32);
+    store_of(store, L);
+    const int64_t K = gate_up ? L.hidden : L.inter, M = gate_up ? 2 * L.inter : L.hidden;
+    TORCH_CHECK(values.dim() == 2 && values.size(1) == K && scales.size(1) * block_of(L) == K &&
+                    out.dim() == 2 && out.size(1) == M && out.size(0) >= values.size(0),
+                "values [routes][k], scales [routes][k / block], out [routes][rows]");
+    ok(gx::enqueue_declared_rows(values.data_ptr<int8_t>(), scales.data_ptr<float>(), store.data_ptr<uint8_t>(), L,
+                                 gate_up, items_of(item_slot, item_routes, item_count), out.data_ptr<float>(),
+                                 at::cuda::getCurrentCUDAStream()),
+       "declared_rows");
+}
+
+void declared_intermediate(const torch::Tensor& gate_up, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+                           const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+                           const torch::Tensor& item_count, torch::Tensor& values, torch::Tensor& scales) {
+    const c10::cuda::CUDAGuard guard(gate_up.device());
+    const gx::Layout L = layout_of(layout);
+    typed(gate_up, "gate_up", torch::kFloat32);
+    typed(values, "values", torch::kInt8);
+    typed(scales, "scales", torch::kFloat32);
+    store_of(store, L);
+    TORCH_CHECK(gate_up.dim() == 2 && gate_up.size(1) == 2 * L.inter && values.size(1) == L.inter &&
+                    values.size(0) >= gate_up.size(0) && scales.size(1) * block_of(L) == L.inter,
+                "gate_up [routes][2 * inter], values [routes][inter], scales [routes][inter / block]");
+    ok(gx::enqueue_declared_intermediate(gate_up.data_ptr<float>(), store.data_ptr<uint8_t>(), L,
+                                         items_of(item_slot, item_routes, item_count), values.data_ptr<int8_t>(),
+                                         scales.data_ptr<float>(), at::cuda::getCurrentCUDAStream()),
+       "declared_intermediate");
+}
