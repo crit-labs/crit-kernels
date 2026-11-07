@@ -10,10 +10,22 @@ CUDA kernels for the recurrent layers of hybrid language models, from [crit](htt
   verify.
 - **Mamba-2** state-space recurrence: `ssd_prefill` and `ssd_scan`.
 - **Short causal depthwise convolution** with its carried window: `causal_conv1d`.
+- **Pools of sequences** for serving many requests and speculative rounds: `pool_delta` runs the decode and verify
+  rows of many sequences in one launch, each row from its own sequence's state in a pool
+  `[layers][sequences][v_heads][dk][dv]` (FP32), keys and queries L2-normalized inside the scan, BF16, FP16 or FP32
+  inputs, grouped key heads, dk up to 256 and any dv; a row either stashes each token's normalized key, decay and delta
+  (a deferred commit: the sequence's next row replays the accepted prefix first), writes the state before and after
+  every token (per-column checkpoints), keeps its start state (a recompute commit, `pool_delta_replay`), or keeps its
+  final state (a prompt row). Rows come from a table the host writes or from a captured round's device tensors and a
+  slot table, so a round is captured once. `pool_conv` / `conv_segments`: the causal convolution over pooled windows,
+  deferred the same way, and long rows split into 32-row segments with the same bits. The commit's bookkeeping (writing
+  the accepted count, selecting a checkpoint) is the caller's.
 
 The scans are column invariant (a token decoded alone equals the same token inside a multi-token verify, bit for bit)
 and can write the state after every token (`checkpoints`), which speculative decoding needs to roll back rejected
-drafts. Per-token decays are FP64 `exp` rounded once to FP32, so a decay near 1 does not drift the state over a long
+drafts. The pool rows add row invariance (a row's bits do not depend on the rows beside it) and one update expression on
+every path (verify, checkpoint, stash replay, recompute), so every commit strategy gives the same bits as decoding the
+accepted tokens one by one. Per-token decays are FP64 `exp` rounded once to FP32, so a decay near 1 does not drift the state over a long
 decode. Everything is FP32; the state is updated in place. Key dims 64 or 128, value dims a multiple of 64 (Mamba-2:
 d_state 64 or 128, head_dim a multiple of 32).
 

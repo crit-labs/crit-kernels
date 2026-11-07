@@ -25,3 +25,29 @@ void ssd_prefill(torch::Tensor& out, torch::Tensor& state, const torch::Tensor& 
 void ssd_scan(torch::Tensor& out, torch::Tensor& state, const torch::Tensor& x, const torch::Tensor& dt,
               const torch::Tensor& B, const torch::Tensor& C, const torch::Tensor& A, const std::optional<torch::Tensor>& D,
               const std::optional<torch::Tensor>& checkpoints);
+
+// Pools of sequences (recurrent_rows.h): states [layers][sequences][v_heads][dk][dv], stash
+// [layers][sequences][2 * half], control [layers][sequences][2 * blocks] (pool_delta), and windows
+// [layers][sequences][channels][width - 1], stash [layers][sequences][capacity][channels], pending
+// [layers][sequences][blocks] (pool_conv). Rows from meta [rows][4] (first, tokens, sequence, kind) or a round's
+// starts / slots and the pool's slot table.
+void pool_delta(torch::Tensor& out, torch::Tensor& states, torch::Tensor& stash, torch::Tensor& control,
+                const std::optional<torch::Tensor>& scratch, const torch::Tensor& q, const torch::Tensor& k,
+                const torch::Tensor& v, const torch::Tensor& log_decay, const torch::Tensor& beta,
+                const std::optional<torch::Tensor>& meta, const std::optional<torch::Tensor>& starts,
+                const std::optional<torch::Tensor>& slots, const std::optional<torch::Tensor>& table, int64_t rows,
+                int64_t kind, int64_t layer, int64_t capacity, double epsilon, double scale, bool normalize_keys,
+                bool normalize_queries);
+void pool_delta_replay(torch::Tensor& states, torch::Tensor& stash, torch::Tensor& control,
+                       const std::optional<torch::Tensor>& scratch, const std::optional<torch::Tensor>& accepted,
+                       const std::optional<torch::Tensor>& meta, const std::optional<torch::Tensor>& slots,
+                       const std::optional<torch::Tensor>& table, int64_t rows, int64_t columns, int64_t capacity,
+                       int64_t key_heads, int64_t mode);
+void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, torch::Tensor& pending,
+               const std::optional<torch::Tensor>& scratch, const torch::Tensor& x, const torch::Tensor& weight,
+               const std::optional<torch::Tensor>& bias, const std::optional<torch::Tensor>& meta,
+               const std::optional<torch::Tensor>& starts, const std::optional<torch::Tensor>& slots,
+               const std::optional<torch::Tensor>& table, int64_t rows, int64_t kind, int64_t layer, int64_t layers,
+               int64_t capacity, bool silu);
+void conv_segments(torch::Tensor& out, const torch::Tensor& window_in, torch::Tensor& window_out, const torch::Tensor& x,
+                   const torch::Tensor& weight, const std::optional<torch::Tensor>& bias, bool silu);

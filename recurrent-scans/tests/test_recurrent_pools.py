@@ -1,0 +1,281 @@
+"""The pool kernels (pool_delta, pool_delta_replay, pool_conv, conv_segments) against a float64 recurrence:
+rows of many sequences in one launch, each from its own state; a row's bits independent of the rows beside it; the three
+commit strategies bit for bit the same as decoding the accepted tokens one by one, for every accepted count; and
+capture in a CUDA graph."""
+import pytest
+import torch
+
+import kernels
+
+rs = kernels.get_kernel("crit-labs/recurrent-scans", version=1)
+dev = torch.device("cuda")
+
+
+def normal(x, eps):
+    return x / torch.sqrt((x * x).sum(-1, keepdim=True) + eps)
+
+
+def reference(q, k, v, g, b, state, scale, eps=1e-6):
+    """float64 recurrence over raw q, k [T][kh][dk] (normalized here), v [T][vh][dv]; state [vh][dk][dv]."""
+    q, k = normal(q.double(), eps), normal(k.double(), eps)
+    v, g, b, S = v.double(), g.double(), b.double(), state.double().clone()
+    vh, kh = v.shape[1], q.shape[1]
+    out = torch.empty(v.shape, dtype=torch.float64, device=v.device)
+    for t in range(v.shape[0]):
+        for h in range(vh):
+            j = h // (vh // kh)
+            e = torch.exp(g[t, h])
+            delta = b[t, h] * (v[t, h] - e * S[h].T @ k[t, j])
+            S[h] = e * S[h] + torch.outer(k[t, j], delta)
+            out[t, h] = scale * S[h].T @ q[t, j]
+    return out, S
+
+
+class Pool:
+    def __init__(self, layers, sequences, kh, vh, dk, dv, capacity, slots=8):
+        self.shape = (kh, vh, dk, dv)
+        self.capacity = capacity
+        self.states = torch.zeros(layers, sequences, vh, dk, dv, device=dev)
+        half = rs.pool_half_floats(kh, vh, dk, dv, capacity)
+        self.stash = torch.zeros(layers, sequences, 2 * half, device=dev)
+        self.control = torch.zeros(layers, sequences, 2 * rs.pool_blocks(vh, dv), dtype=torch.int32, device=dev)
+        self.checkpoints = torch.zeros(layers, slots, capacity + 1, vh * dk * dv, device=dev)
+        self.starts = torch.zeros(layers, slots, vh * dk * dv, device=dev)
+        self.table = torch.full((slots,), -1, dtype=torch.int32, device=dev)
+
+    def rows(self, layer, q, k, v, g, b, rows, scale, scratch=None):
+        """rows: (first, tokens, sequence, kind)."""
+        meta = torch.tensor(rows, dtype=torch.int32, device=dev)
+        out = torch.zeros(v.shape, device=dev)
+        rs.pool_delta(out, self.states, self.stash, self.control, scratch, q, k, v, g, b, meta=meta, rows=len(rows),
+                      kind=0, layer=layer, capacity=self.capacity, scale=scale)
+        return out
+
+    def record(self, accepted, sequences):
+        """The deferred commit (the caller's bookkeeping): each sequence's pending counts."""
+        blocks = rs.pool_blocks(self.shape[1], self.shape[3])
+        for n, s in zip(accepted, sequences):
+            self.control[:, s, :blocks] = n
+
+    def flush(self, sequences):
+        meta = torch.tensor([[0, 0, s, 4] for s in sequences], dtype=torch.int32, device=dev)
+        rs.pool_delta_replay(self.states, self.stash, self.control, None, None, meta=meta, rows=len(sequences),
+                             capacity=self.capacity, key_heads=self.shape[0], mode=rs.FLUSH_PENDING)
+
+    def commit(self, strategy, accepted, slots, columns):
+        """A round's commit at accepted ([rows] int64 on the device), rows in round slots `slots`."""
+        kh, vh, dk, dv = self.shape
+        sequences = self.table[slots].long()
+        if strategy == "deferred":
+            self.control[:, sequences, :rs.pool_blocks(vh, dv)] = accepted.clamp(0, columns).int()[None, :, None]
+        elif strategy == "checkpoints":
+            chosen = self.checkpoints[:, slots, accepted.clamp(0, columns)]
+            self.states[:, sequences] = chosen.view(self.states.shape[0], -1, *self.states.shape[2:])
+        else:
+            rs.pool_delta_replay(self.states, self.stash, self.control, self.starts, accepted, slots=slots,
+                                 table=self.table, rows=len(slots), columns=columns, capacity=self.capacity,
+                                 key_heads=kh, mode=rs.REPLAY)
+
+
+def inputs(T, kh, vh, dk, dv, seed, dtype=torch.float32, strong=False):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    q = torch.randn(T, kh, dk, generator=g)
+    k = torch.randn(T, kh, dk, generator=g)
+    v = torch.randn(T, vh, dv, generator=g)
+    logd = -(torch.rand(T, vh, generator=g) * 9 + 3) if strong else -torch.rand(T, vh, generator=g) * 0.5
+    beta = torch.rand(T, vh, generator=g)
+    return [t.to(dev) for t in (q.to(dtype), k.to(dtype), v.to(dtype), logd, beta)]
+
+
+SHAPES = [(2, 4, 64, 64), (16, 48, 128, 128), (1, 2, 4, 3), (2, 2, 100, 40), (1, 1, 256, 32)]
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("strong", [False, True])
+def test_rows_of_two_sequences_match_the_recurrence(shape, strong):
+    kh, vh, dk, dv = shape
+    pool = Pool(1, 3, kh, vh, dk, dv, capacity=4)
+    q, k, v, g, b = inputs(7, kh, vh, dk, dv, seed=3, strong=strong)
+    scale = dk ** -0.5
+    out = pool.rows(0, q, k, v, g, b, [(0, 3, 0, 0), (3, 4, 2, 0)], scale)
+    pool.record([3, 4], [0, 2])
+    pool.flush([0, 2])
+    for first, count, seq in ((0, 3, 0), (3, 4, 2)):
+        rows = slice(first, first + count)
+        ref_out, ref_state = reference(q[rows], k[rows], v[rows], g[rows], b[rows], torch.zeros(vh, dk, dv, device=dev), scale)
+        torch.testing.assert_close(out[rows].double(), ref_out, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(pool.states[0, seq].double(), ref_state, rtol=1e-4, atol=1e-5)
+    assert torch.count_nonzero(pool.states[0, 1]) == 0
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_row_alone_has_the_bits_it_has_beside_others(dtype):
+    kh, vh, dk, dv = 2, 6, 128, 64
+    q, k, v, g, b = inputs(10, kh, vh, dk, dv, seed=5, dtype=dtype)
+    together = Pool(1, 4, kh, vh, dk, dv, capacity=4)
+    out = together.rows(0, q, k, v, g, b, [(0, 4, 0, 0), (4, 1, 1, 0), (5, 3, 3, 0), (8, 2, 2, 0)], 0.3)
+    for first, count, seq in ((0, 4, 0), (4, 1, 1), (5, 3, 3), (8, 2, 2)):
+        alone = Pool(1, 4, kh, vh, dk, dv, capacity=4)
+        rows = slice(first, first + count)
+        found = alone.rows(0, q[rows], k[rows], v[rows], g[rows], b[rows], [(0, count, seq, 0)], 0.3)
+        assert torch.equal(found, out[rows])
+
+
+def strategy_round(strategy, pool, q, k, v, g, b, n, slot=0, sequence=1):
+    """One verify row of len(q) columns from sequence `sequence` in round slot `slot`, committed at n."""
+    pool.table[slot] = sequence
+    cols = q.shape[0]
+    starts = torch.tensor([0, cols], dtype=torch.int32, device=dev)
+    slots = torch.tensor([slot], dtype=torch.int64, device=dev)
+    accepted = torch.tensor([n], dtype=torch.int64, device=dev)
+    kind = {"deferred": rs.STASH, "checkpoints": rs.CHECKPOINTS, "recompute": rs.RECOMPUTE}[strategy]
+    scratch = {"deferred": None, "checkpoints": pool.checkpoints[0], "recompute": pool.starts[0]}[strategy]
+    out = torch.zeros(v.shape, device=dev)
+    rs.pool_delta(out, pool.states, pool.stash, pool.control, scratch, q, k, v, g, b, starts=starts, slots=slots,
+                  table=pool.table, rows=1, kind=kind, layer=0, capacity=pool.capacity, scale=0.25)
+    pool.commit(strategy, accepted, slots, cols)
+    return out
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("strategy", ["deferred", "checkpoints", "recompute"])
+def test_every_accepted_count_continues_as_the_serial_decode(strategy):
+    kh, vh, dk, dv, W = 2, 4, 128, 64, 4
+    q, k, v, g, b = inputs(2 + (W + 1) + 3, kh, vh, dk, dv, seed=11)
+    for n in range(W + 2):
+        # Serial: tokens one by one, each accepted.
+        serial = Pool(1, 2, kh, vh, dk, dv, capacity=W + 1)
+        outs = []
+        for t in range(2 + n + 3):
+            row = slice(t, t + 1)
+            outs.append(serial.rows(0, q[row], k[row], v[row], g[row], b[row], [(0, 1, 1, 0)], 0.25))
+            serial.record([1], [1])
+        serial.flush([1])
+        # Speculative: 2 tokens, a verify window of W + 1 with n accepted, then the 3 tokens after the accepted ones.
+        spec = Pool(1, 2, kh, vh, dk, dv, capacity=W + 1)
+        for t in range(2):
+            row = slice(t, t + 1)
+            spec.rows(0, q[row], k[row], v[row], g[row], b[row], [(0, 1, 1, 0)], 0.25)
+            spec.record([1], [1])
+        window = slice(2, 2 + W + 1)
+        verified = strategy_round(strategy, spec, q[window], k[window], v[window], g[window], b[window], n)
+        for c in range(n):
+            assert torch.equal(verified[c:c + 1], outs[2 + c]), (strategy, n, c)
+        tail = [2 + n + i for i in range(3)]
+        for i, t in enumerate(tail):
+            # the continuation reads the inputs the serial decode read at that position
+            row = slice(t, t + 1)
+            found = spec.rows(0, q[row], k[row], v[row], g[row], b[row], [(0, 1, 1, 0)], 0.25)
+            spec.record([1], [1])
+            assert torch.equal(found, outs[t]), (strategy, n, i)
+        spec.flush([1])
+        assert torch.equal(spec.states, serial.states), (strategy, n)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("strategy", ["deferred", "checkpoints", "recompute"])
+def test_a_commit_runs_again_with_a_smaller_count(strategy):
+    kh, vh, dk, dv = 1, 2, 64, 64
+    q, k, v, g, b = inputs(5, kh, vh, dk, dv, seed=13)
+    once, twice = (Pool(1, 2, kh, vh, dk, dv, capacity=5) for _ in range(2))
+    strategy_round(strategy, once, q, k, v, g, b, 2)
+    strategy_round(strategy, twice, q, k, v, g, b, 4)
+    accepted = torch.tensor([2], dtype=torch.int64, device=dev)
+    slots = torch.tensor([0], dtype=torch.int64, device=dev)
+    twice.commit(strategy, accepted, slots, 5)
+    once.flush([1])
+    twice.flush([1])
+    assert torch.equal(once.states, twice.states)
+
+
+@pytest.mark.kernels_ci
+def test_a_round_captures_and_replays():
+    kh, vh, dk, dv, W, R = 2, 4, 64, 64, 3, 2
+    pool = Pool(1, 4, kh, vh, dk, dv, capacity=W + 1)
+    pool.table[0], pool.table[1] = 3, 1
+    q, k, v, g, b = (torch.zeros_like(t) for t in inputs(R * (W + 1), kh, vh, dk, dv, seed=1))
+    starts = torch.arange(0, R * (W + 1) + 1, W + 1, dtype=torch.int32, device=dev)
+    slots = torch.arange(R, dtype=torch.int64, device=dev)
+    accepted = torch.zeros(R, dtype=torch.int64, device=dev)
+    out = torch.zeros(v.shape, device=dev)
+
+    def round_():
+        rs.pool_delta(out, pool.states, pool.stash, pool.control, None, q, k, v, g, b, starts=starts, slots=slots,
+                      table=pool.table, rows=R, kind=rs.STASH, layer=0, capacity=W + 1, scale=0.25)
+        pool.commit("deferred", accepted, slots, W + 1)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        round_()
+    torch.cuda.synchronize()
+    pool.states.zero_()
+    pool.control.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        round_()
+    eager = Pool(1, 4, kh, vh, dk, dv, capacity=W + 1)
+    eager.table.copy_(pool.table)
+    for seed, counts in ((2, [2, 4]), (3, [0, 1]), (4, [4, 3])):
+        new = inputs(R * (W + 1), kh, vh, dk, dv, seed=seed)
+        for t, n in zip((q, k, v, g, b), new):
+            t.copy_(n)
+        accepted.copy_(torch.tensor(counts, device=dev))
+        graph.replay()
+        expected = torch.zeros(v.shape, device=dev)
+        rs.pool_delta(expected, eager.states, eager.stash, eager.control, None, q, k, v, g, b, starts=starts, slots=slots,
+                      table=eager.table, rows=R, kind=rs.STASH, layer=0, capacity=W + 1, scale=0.25)
+        eager.commit("deferred", accepted, slots, W + 1)
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected)
+    assert torch.equal(pool.states, eager.states) and torch.equal(pool.control, eager.control)
+
+
+def conv_reference(x, weight, bias, window, silu=True):
+    padded = torch.cat([window.T.double(), x.double()])
+    w = weight.shape[1]
+    out = torch.stack([(padded[t:t + w].T * weight.double()).sum(1) + bias.double() for t in range(x.shape[0])])
+    return torch.nn.functional.silu(out) if silu else out, padded[-(w - 1):].T
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("width", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_pool_convolution_keeps_each_sequences_window(width, dtype):
+    g = torch.Generator(device="cpu").manual_seed(width)
+    C, cap = 300, 4
+    x = torch.randn(9, C, generator=g).to(dev).to(dtype)
+    weight = torch.randn(C, width, generator=g).to(dev)
+    bias = torch.randn(C, generator=g).to(dev)
+    window = torch.zeros(1, 3, C, width - 1, device=dev)
+    window[0, 2] = torch.randn(C, width - 1, generator=g).to(dev)
+    start = window[0, 2].clone()
+    stash = torch.zeros(1, 3, cap, C, device=dev)
+    pending = torch.zeros(1, 3, rs.pool_conv_blocks(C), dtype=torch.int32, device=dev)
+    out = torch.zeros_like(x)
+    meta = torch.tensor([[0, 3, 2, rs.STASH], [3, 2, 0, rs.STASH]], dtype=torch.int32, device=dev)
+    rs.pool_conv(out, window, stash, pending, None, x, weight, bias, meta=meta, rows=2, capacity=cap)
+    ref, ref_window = conv_reference(x[:3].float(), weight, bias, start)
+    torch.testing.assert_close(out[:3].double(), ref.to(dtype).double(), rtol=1e-2 if dtype != torch.float32 else 1e-5,
+                               atol=1e-2 if dtype != torch.float32 else 1e-5)
+    assert torch.equal(window[0, 2], start)   # pending until committed
+    pending[0, 2] = 2   # accept 2 of the 3 inputs
+    flush = torch.tensor([[0, 0, 2, rs.FLUSH]], dtype=torch.int32, device=dev)
+    rs.pool_conv(out[:0], window, stash, pending, None, x[:0], weight, bias, meta=flush, rows=1, capacity=cap)
+    _, expected = conv_reference(x[:2].float(), weight, bias, start)
+    torch.testing.assert_close(window[0, 2].double(), expected, rtol=0, atol=0)
+    # A long row through the segments kernel has the row kernel's bits.
+    long = torch.randn(70, C, generator=g).to(dev).to(dtype)
+    seg_out, seg_window = torch.empty_like(long), torch.empty(C, width - 1, device=dev)
+    rs.conv_segments(seg_out, window[0, 2].clone(), seg_window, long, weight, bias)
+    scratch = torch.zeros(1, C, width - 1, device=dev)
+    row_out = torch.empty_like(long)
+    meta = torch.tensor([[0, 70, 2, rs.FINAL]], dtype=torch.int32, device=dev)
+    rs.pool_conv(row_out, window, stash, pending, scratch, long, weight, bias, meta=meta, rows=1, capacity=cap)
+    assert torch.equal(seg_out, row_out) and torch.equal(seg_window, scratch[0])
+    # rows shorter than the window
+    short = long[:1]
+    s_out, s_window = torch.empty_like(short), torch.empty(C, width - 1, device=dev)
+    rs.conv_segments(s_out, window[0, 2].clone(), s_window, short, weight, bias)
+    _, expected = conv_reference(short.float(), weight, bias, window[0, 2])
+    torch.testing.assert_close(s_window.double(), expected, rtol=0, atol=0)
