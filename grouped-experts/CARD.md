@@ -67,4 +67,21 @@ bitwise invariance, slot tables, capture and the quantizer.
 
 ## Measured speed
 
-RTX 5090 (sm_120), local build, torch 2.14.1 + CUDA 13: see crit's notes until the publish build is measured.
+RTX 5090 (sm_120), local build (torch 2.14.1, CUDA 13.1), every expert in device memory; torch.mm BF16 8192^3 runs
+207.5 TFLOPS on the same GPU. Decode: a CUDA graph of 48 layer calls, each with its own uniform random routes over one
+store of every expert (so a layer's experts are mostly not in L2), time per layer call (plan, gate/up, down,
+combine) and the weight bytes it moves. Prompt: one call of a chunk.
+
+| Experts | Decode 1 / 2 / 4 / 8 tokens (us, weight GB/s) | Prompt 2,048 / 8,192 tokens (ms, TFLOPS) |
+| --- | --- | --- |
+| nvfp4 W4A16, 512 x top 10, 2560 x 640 | 42.2 (659) / 73.0 (753) / 131.3 (821) / 242.8 (858) | 3.84 (52.4) / 10.25 (78.6) |
+| nvfp4 W4A4, same | 45.9 (605) / 76.8 (715) / 136.2 (791) / 247.9 (840) | 4.17 (48.3) / 10.60 (75.9) |
+| mxfp4, same | 41.3 / 72.0 / 127.2 / 237.4 | |
+| int4, same | 42.0 / 72.4 / 130.3 / 242.1 | |
+| fp8 channel, 128 x top 8, 4096 x 1536 | 120.6 (1254) / 226.8 (1293) / 407.1 (1349) / 692.2 (1419) | 6.42 (96.3) / 22.16 (111.6) |
+| fp8 128 x 128 block, same | 140.3 (1077) / 276.6 (1059) / 481.4 (1140) / 831.1 (1180) | 7.67 (80.6) / 23.97 (103.2) |
+| bf16, same | 196.4 (1538) / 369.8 (1585) / 668.2 (1642) / 1183.2 (1658) | 6.58 (94.0) / 22.91 (108.0) |
+
+Per-kernel (nvfp4 W4A16, 512 experts): one decode token: gate/up 27.8 us, down 9.6, plan 2.9, combine 2.2. The
+small experts' gate/up pass (a k loop of 2,560 against down's 640) moves weights at about 600 GB/s against down's
+about 1 TB/s: the decode limit of this baseline at that shape.

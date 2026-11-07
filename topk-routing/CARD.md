@@ -42,4 +42,11 @@ Run `tests/test_topk_routing.py` on the target against the local build.
 
 ## Measured speed
 
-RTX 5090 (sm_120), local build: see crit's notes until the publish build is measured.
+RTX 5090 (sm_120), local build; a CUDA graph of 48 selections, time per selection, against crit's topk-router
+in torch (softmax, a stable sort) on the same logits:
+
+| Experts, top | 1 / 4 / 8 / 32 tokens (us) | torch (us) |
+| --- | --- | --- |
+| 512, 10 | 5.6-6.3 | 27.4-30.4 |
+| 256, 8 | 3.5-4.5 | 26.9-29.8 |
+| 128, 8 | 2.8-3.5 | 19.4-22.9 |
