@@ -15,25 +15,35 @@ KV pool and its attention plugins):
   pages through per-row page tables, split over KV partitions: piece `i` (16 to 128 positions, set by the head width
   and the page kind) goes to partition `i mod P`, each partition walks only up to its row's last position (read on
   the device), and the partials merge in partition order by their log-sum-exps. The work follows each row's length,
-  not the cache's capacity, and one CUDA graph replays at every length. Tree masks (`parents`: a draft tree's columns see their ancestors and themselves), block-sparse
-  lists (`blocks`, `block_size`: a token sees only its listed KV blocks) and log-sum-exp outputs (`lse`).
+  not the cache's capacity, and one CUDA graph replays at every length. Tree masks (`parents`: a draft tree's columns
+  see their ancestors and themselves), block-sparse lists (`blocks`, `block_size`: a token sees only its listed KV
+  blocks), log-sum-exp outputs (`lse`), and partials packed by the rows' tokens (`offsets`), so a launch's workspace
+  follows its tokens.
 - **`prefill`**: a causal prompt chunk of one sequence over its pages (any page kind; `int8_qk` multiplies INT8 queries
   with INT8 keys on integer tensor cores).
 
 Numerics: codes convert exactly to BF16 (FP16 for FP16 pages); scores and the softmax in FP32 with BF16 probabilities
-on the tensor cores; the row sums run on the tensor cores too, so a column's bits do not depend on the tile shape. A
-column's result depends only on its own keys and query, the partition count and the page kind: not on the rows beside
-it, not on how many columns its launch reads (a token decoded alone equals the same token inside a verify window, bit
-for bit). Errors against float64 attention over the stored values: within 8e-3 absolute (BF16 queries and
-probabilities), log-sum-exps within 1e-3. E4M3 codes convert with the hardware conversion from sm_89 and with integer
-arithmetic before (the same bits).
+on the tensor cores. Every window launch over a cache takes one query tile and configuration (`pinned`: 32 rows, or a
+power of two of a KV head's query heads past that, in two warps): two warps are less than a warpgroup, so every GPU
+multiplies the tile with mma.sync (sm_90's wgmma and sm_100's tcgen05 take four warps over 64 rows or more; the tests
+compile the pinned launch for sm_80, sm_90, sm_100 and sm_120 and check), and the row sums run on the tensor cores in a
+fixed order too. A column's result depends only on its own keys and query, the partition count, the piece size and
+the page kind: not on the rows beside it, not on how many columns or rows its launch reads (a token decoded alone
+equals the same token inside a verify window, bit for bit). A launch given another tile or warp count keeps that only
+where the GPU multiplies it with mma.sync as well. Errors against float64 attention over the stored values: within
+8e-3 absolute (BF16 queries and probabilities), log-sum-exps within 1e-3. E4M3 codes convert with the hardware
+conversion from sm_89 and with integer arithmetic before (the same bits).
+
+Defaults: the partition rule (`partitions`: about 1.5 programs per SM over FP8 and INT8 pages, 0.75 over 16-bit ones),
+the piece size (`piece_size`: 8,192 or 16,384 head values a piece), the pinned tile and its warps and stages were
+measured on one sm_120 GPU (an RTX 5090) and are defaults: a caller may give its own partitions and piece (both change
+a column's bits, so one per cache).
 
 Formats and shapes: head dims 16..256 (powers of two; keys and values may differ), any page size, grouped query heads
 (query heads a multiple of the KV heads), any number of rows. GPUs: CUDA GPUs Triton supports (sm_80 and newer); tested
 on an RTX 5090 (sm_120).
 
-Measured on one RTX 5090 (CUDA graph replays, the GPU alone), 24 query / 4 KV heads x 256 (Qwen3.8-27B's attention),
-FP8 pages with a scale per position and head, 64-position pages, one row: 17.8 us at 4K positions, 57.8 us at 32K,
+Measured on one RTX 5090 (CUDA graph replays, the GPU alone), 24 query / 4 KV heads x 256, FP8 pages with a scale per position and head, 64-position pages, one row: 17.8 us at 4K positions, 57.8 us at 32K,
 344 us at 200K for a decode token (1,210 GB/s), 331 us for a 4-column verify window (1,256 GB/s), 492 us for 8
 columns; eight rows at 200K, 2.46 ms (1,352 GB/s). FlashInfer 0.7.3 over FP8 pages with a layer scale on the same
 shapes: 283 us decode, 388 us for a 4-column window (its batch prefill), 2.03 ms for eight decode rows.

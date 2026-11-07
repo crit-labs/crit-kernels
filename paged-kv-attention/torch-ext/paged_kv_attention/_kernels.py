@@ -146,6 +146,15 @@ def _piece_values(acc0, acc1, acc2, acc3, alpha, pv, vrow, nm, DV: tl.constexpr,
 
 
 @triton.jit
+def _partial_row(off_ptr, r, COLS: tl.constexpr, OFFSETS: tl.constexpr):
+    """Row r's first partial row in its launch's partials: with OFFSETS its offset past the launch's first row's (the
+    rows' tokens packed one after another), else r * COLS."""
+    if OFFSETS:
+        return (tl.load(off_ptr + r) - tl.load(off_ptr)).to(tl.int64)
+    return r.to(tl.int64) * COLS
+
+
+@triton.jit
 def _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV: tl.constexpr, DC: tl.constexpr):
     dc = tl.arange(0, DC)
     row = po_ptr + idx[:, None] * DV
@@ -160,11 +169,11 @@ def _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV: tl.constexpr,
 
 @triton.jit
 def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, par_ptr,
-                   po_ptr, pm_ptr, pl_ptr, stride_qt, stride_qh, tab_stride, tab_width, n_parts, sm_scale, k_mult,
-                   v_mult, count_all, COLS: tl.constexpr, CPT: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr,
-                   G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, PIECE: tl.constexpr,
-                   PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr, TREE: tl.constexpr,
-                   COUNTS: tl.constexpr, DC: tl.constexpr):
+                   off_ptr, po_ptr, pm_ptr, pl_ptr, stride_qt, stride_qh, tab_stride, tab_width, n_parts, sm_scale,
+                   k_mult, v_mult, count_all, COLS: tl.constexpr, CPT: tl.constexpr, HQ: tl.constexpr,
+                   HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr,
+                   PIECE: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
+                   TREE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr, DC: tl.constexpr):
     """Program (column tile, partition b, row x KV head): the tile's query rows (its columns x the KV head's query
     heads) over pieces b, b + n_parts, ... of the row's keys, up to its last column's position; writes each row's
     unnormalized output, running maximum and sum into the partials."""
@@ -174,7 +183,7 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
     r = rk // HKV
     kvh = rk % HKV
     if COUNTS:
-        count = tl.load(count_ptr + r)
+        count = tl.minimum(tl.load(count_ptr + r), COLS)
     else:
         count = count_all
     c0 = mt * CPT
@@ -232,7 +241,7 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
             # The row sums on the tensor cores too: a fixed summation order, whatever the tile's layout.
             l_i = l_i * alpha + tl.max(tl.dot(p.to(ones.dtype), ones), axis=1)
             m_i = m_new
-        idx = ((r * COLS + c) * HQ + kvh * G + g) * n_parts + b
+        idx = ((_partial_row(off_ptr, r, COLS, OFFSETS) + c) * HQ + kvh * G + g) * n_parts + b
         _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV, DC)
         tl.store(pm_ptr + idx, m_i, mask=live)
         tl.store(pl_ptr + idx, l_i, mask=live)
@@ -240,11 +249,12 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
 
 @triton.jit
 def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, par_ptr,
-                   blk_ptr, blk_stride, n_blocks, block_size, po_ptr, pm_ptr, pl_ptr, stride_qt, stride_qh, tab_stride,
-                   tab_width, n_parts, sm_scale, k_mult, v_mult, count_all, COLS: tl.constexpr, HQ: tl.constexpr,
-                   HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr,
-                   PIECE: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
-                   TREE: tl.constexpr, COUNTS: tl.constexpr, DC: tl.constexpr):
+                   off_ptr, blk_ptr, blk_stride, n_blocks, block_size, po_ptr, pm_ptr, pl_ptr, stride_qt, stride_qh,
+                   tab_stride, tab_width, n_parts, sm_scale, k_mult, v_mult, count_all, COLS: tl.constexpr,
+                   HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr,
+                   BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr,
+                   HW_FP8: tl.constexpr, TREE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr,
+                   DC: tl.constexpr):
     """Program (partition b, KV head, row x column): one token's query heads of the KV head over the positions of its
     listed KV blocks (blocks[token][0 .. n_blocks - 1], -1 for none), read as one run of n_blocks * block_size
     positions in list order, its tiles b, b + n_parts, ...; positions past the token's own (or outside its tree) are
@@ -255,7 +265,7 @@ def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
     r = rc // COLS
     c = (rc % COLS).to(tl.int64)
     if COUNTS:
-        count = tl.load(count_ptr + r)
+        count = tl.minimum(tl.load(count_ptr + r), COLS)
     else:
         count = count_all
     n_tiles = tl.cdiv(n_blocks * block_size, PIECE)
@@ -311,17 +321,17 @@ def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
                                                    nm, DV, DC, KIND, HW_FP8)
             l_i = l_i * alpha + tl.max(tl.dot(p.to(ones.dtype), ones), axis=1)
             m_i = m_new
-        idx = ((r * COLS + c) * HQ + kvh * G + g) * n_parts + b
+        idx = ((_partial_row(off_ptr, r, COLS, OFFSETS) + c) * HQ + kvh * G + g) * n_parts + b
         _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV, DC)
         tl.store(pm_ptr + idx, m_i, mask=live)
         tl.store(pl_ptr + idx, l_i, mask=live)
 
 
 @triton.jit
-def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr, first_ptr, n_parts, n_fixed,
+def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr, first_ptr, off_ptr, n_parts, n_fixed,
                   stride_ot, stride_oh, count_all, COLS: tl.constexpr, HQ: tl.constexpr, DV: tl.constexpr,
-                  PIECE: tl.constexpr, COUNTS: tl.constexpr, LSE: tl.constexpr, BLOCK_P: tl.constexpr,
-                  CHUNK_P: tl.constexpr):
+                  PIECE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr, LSE: tl.constexpr,
+                  BLOCK_P: tl.constexpr, CHUNK_P: tl.constexpr):
     """Program (column, query head, row): the partials of the partitions that hold the column's keys, merged by their
     maxima and sums (log-sum-exp weights) into the output row (and its log-sum-exp). The sums run over tiles of
     CHUNK_P partitions in partition order, a tile's in one fixed tree: the same order for every launch over a pool
@@ -330,7 +340,7 @@ def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr
     h = tl.program_id(1)
     r = tl.program_id(2)
     if COUNTS:
-        count = tl.load(count_ptr + r)
+        count = tl.minimum(tl.load(count_ptr + r), COLS)
     else:
         count = count_all
     if c < count:
@@ -340,7 +350,7 @@ def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr
         else:
             first = tl.load(first_ptr + r).to(tl.int64)
             nb = tl.minimum(n_parts, tl.cdiv(first + c + 1, PIECE)).to(tl.int32)
-        base = ((r * COLS + c) * HQ + h).to(tl.int64) * n_parts
+        base = ((_partial_row(off_ptr, r, COLS, OFFSETS) + c) * HQ + h) * n_parts
         dv = tl.arange(0, DV)
         b = tl.arange(0, BLOCK_P)
         ms = tl.load(pm_ptr + base + b, mask=b < nb, other=float("-inf"))

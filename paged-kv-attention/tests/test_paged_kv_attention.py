@@ -162,10 +162,62 @@ def test_rows_and_columns_are_invariant_bit_for_bit(kind):
         for c in range(8):    # each column decoded alone, in a launch of one column
             one = cache.attend(q[start + c:start + c + 1], [s], [0], [first + c], 1)
             assert torch.equal(one[0], together[start + c])
-        # ... and inside a wider launch whose rows are shorter than its columns, with any tile
+        # ... and inside a wider launch whose rows are shorter than its columns
         wide = cache.attend(q[start:start + 8], [s], [0], [first], 16,
-                            counts=torch.tensor([8], dtype=torch.int32, device=dev), tile=128)
+                            counts=torch.tensor([8], dtype=torch.int32, device=dev))
         assert torch.equal(wide, together[start:start + 8])
+        # ... and its partial rows packed by the rows' tokens (offsets), in a workspace of those tokens only
+        rows3 = [0, 1, 2]
+        counts = torch.tensor([3, 1, 4], dtype=torch.int32, device=dev)
+        offsets = torch.tensor([0, 3, 4], dtype=torch.int32, device=dev)
+        floats = pk.workspace_floats(8, 24, pk.partitions(dev, 4, kind), 256)
+        packed = cache.attend(q, rows3, [0, 8, 16], [690, 290, 2090], 8, counts=counts, offsets=offsets, tokens=8,
+                              workspace=torch.empty(floats, dtype=torch.float32, device=dev))
+        for start, count in zip([0, 8, 16], [3, 1, 4]):
+            assert torch.equal(packed[start:start + count], together[start:start + count])
+
+
+@pytest.mark.kernels_ci
+def test_a_count_past_the_columns_reads_as_the_columns():
+    cache = Cache("bf16", 2, 128, 128, 16, [300, 300])
+    q = _q(8, 8, 128, 11)
+    want = cache.attend(q, [0, 1], [0, 4], [290, 280], 4)
+    got = cache.attend(q, [0, 1], [0, 4], [290, 280], 4, counts=torch.tensor([9, 4], dtype=torch.int32, device=dev))
+    assert torch.equal(got, want)    # row 0's partials stay its own (no row writes past its columns)
+
+
+def _lowering(arch, group, d, kind):
+    """The MMA instructions Triton gives the pinned window launch for `arch` (compiled offline, no GPU of that kind
+    needed): from the TTGIR, wgmma (warp_group_dot), tcgen05 (tc_gen5_mma) or mma.sync (nvidia_mma v2)."""
+    import triton
+    from triton.backends.compiler import GPUTarget
+    kernel = pk._kernels._window_kernel
+    store = {0: "*bf16", 1: "*u8", 2: "*u8", 3: "*i8"}[kind]
+    signature = {"q_ptr": "*bf16", "k_ptr": store, "v_ptr": store, "ks_ptr": "*fp32", "vs_ptr": "*fp32",
+                 "tab_ptr": "*i32", "trow_ptr": "*i32", "start_ptr": "*i32", "count_ptr": "*i32", "first_ptr": "*i64",
+                 "par_ptr": "*i64", "off_ptr": "*i32", "po_ptr": "*fp32", "pm_ptr": "*fp32", "pl_ptr": "*fp32",
+                 "stride_qt": "i32", "stride_qh": "i32", "tab_stride": "i32", "tab_width": "i32", "n_parts": "i32",
+                 "sm_scale": "fp32", "k_mult": "fp32", "v_mult": "fp32", "count_all": "i32"}
+    rows, warps, stages = pk.pinned(group)
+    constants = {"COLS": 8, "CPT": rows // group, "HQ": group * 2, "HKV": 2, "G": group, "D": d, "DV": d,
+                 "BLOCK_M": rows, "PIECE": pk.piece_size(d, d, ["bf16", "fp8", "fp8:row", "int8"][kind]), "PAGE": 16,
+                 "KIND": kind, "HW_FP8": arch >= 89, "TREE": False, "COUNTS": True, "OFFSETS": True, "DC": min(64, d)}
+    names = kernel.arg_names
+    full = {n: signature.get(n, "constexpr") for n in names}
+    attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if full[n].startswith("*")}
+    source = triton.compiler.ASTSource(fn=kernel, signature=full, constexprs=constants, attrs=attrs)
+    ir = triton.compile(source, target=GPUTarget("cuda", arch, 32),
+                        options={"num_warps": warps, "num_stages": stages}).asm["ttgir"]
+    return {name for name, key in (("wgmma", "warp_group_dot"), ("tcgen05", "tc_gen5_mma"),
+                                   ("mma.sync", "versionMajor = 2")) if key in ir}
+
+
+@pytest.mark.parametrize("arch", [80, 90, 100, 120])
+@pytest.mark.parametrize("group,d,kind", [(6, 256, 2), (12, 256, 0), (7, 128, 3), (64, 128, 0)])
+def test_the_pinned_launch_multiplies_with_mma_sync_on_every_gpu(arch, group, d, kind):
+    # Four warps over 64 rows or more lower to wgmma on sm_90 and tcgen05 on sm_100, whose summation order differs
+    # from mma.sync's: the pinned launch keeps one instruction on every GPU, so a column's bits hold there too.
+    assert _lowering(arch, group, d, kind) == {"mma.sync"}
 
 
 @pytest.mark.kernels_ci
@@ -328,7 +380,7 @@ def test_key_only_writes_leave_no_values(kind):
 def test_a_given_workspace_holds_the_partials_and_a_small_one_is_refused():
     cache = Cache("bf16", 2, 128, 128, 16, [300])
     q = _q(4, 8, 128, 9)
-    floats = pk.workspace_floats(1, 4, 8, 16, 128)
+    floats = pk.workspace_floats(4, 8, 16, 128)
     own = cache.attend(q, [0], [0], [296], 4, partitions=16)
     given = cache.attend(q, [0], [0], [296], 4, partitions=16,
                          workspace=torch.empty(floats, dtype=torch.float32, device=dev))
