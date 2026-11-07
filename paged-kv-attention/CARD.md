@@ -43,18 +43,21 @@ Formats and shapes: head dims 16..256 (powers of two; keys and values may differ
 (query heads a multiple of the KV heads), any number of rows. GPUs: CUDA GPUs Triton supports (sm_80 and newer); tested
 on an RTX 5090 (sm_120).
 
-Measured on one RTX 5090 (CUDA graph replays, the GPU alone), 24 query / 4 KV heads x 256, FP8 pages with a scale per position and head, 64-position pages, one row: 17.8 us at 4K positions, 57.8 us at 32K,
-344 us at 200K for a decode token (1,210 GB/s), 331 us for a 4-column verify window (1,256 GB/s), 492 us for 8
-columns; eight rows at 200K, 2.46 ms (1,352 GB/s). FlashInfer 0.7.3 over FP8 pages with a layer scale on the same
-shapes: 283 us decode, 388 us for a 4-column window (its batch prefill), 2.03 ms for eight decode rows.
+Measured on one RTX 5090 (CUDA graph replays, the GPU alone, the pinned launch), 24 query / 4 KV heads x 256, FP8
+pages with a scale per position and head, 64-position pages, one row: 17.8 us at 4K positions and 333 us at 200K for
+a decode token (1,249 GB/s), 327 us for a 5-column verify window (1,271 GB/s), 618 us for 8 columns; eight rows at
+200K, 2.48 ms (1,343 GB/s). FlashInfer 0.7.3 over FP8 pages with a layer scale on the same shapes: 283 us decode, 388
+us for a 4-column window (its batch prefill), 2.03 ms for eight decode rows.
 
-24 query / 2 KV heads x 256, BF16 pages, one row at 200K: 275 us decode (1,488 GB/s), 280 us for 4 columns, 478 us
-for 8 (FlashInfer: 276, 294, 347 us); FP8 pages with a scale per position and head: 168 us decode (1,239 GB/s).
-56 query / 8 KV heads x 128, INT8 pages with a scale per position and head: 14.5 us at 4K, 337 us at 200K (1,254
-GB/s), 342 us for 4 columns; BF16 pages at 200K: 511 us (FlashInfer: 531 us).
+24 query / 2 KV heads x 256, BF16 pages, one row at 200K: 271 us decode (1,510 GB/s), 635 us for 5 columns, 844 us
+for 8 (FlashInfer: 276 us decode, 294 for 4 columns, 347 for 8). 56 query / 8 KV heads x 128, INT8 pages with a
+scale per position and head: 16.2 us at 4K, 331 us at 200K (1,275 GB/s), 665 us for 5 columns.
 
-Wide windows at short contexts over many rows are bound by the partials (FP32, value width per query head, column and
-partition): 8 rows of 8 columns at 4K positions write more partials than they read pages.
+A tile holds 32 rows: as many columns as fit in 32 rows of a KV head's query heads (5 at 6 heads, 4 at 7, 2 at 12). A
+wider window is read by several tiles, each reading the row's pages again (about the tile count times a tile's time);
+a 64-row tile in four warps reads such windows faster on sm_120 (BF16, 2 KV heads: 274 us for 5 columns) but lowers to
+wgmma on sm_90 and tcgen05 on sm_100, so the pinned launch does not take it. Wide windows at short contexts over many
+rows are bound by the partials (FP32, value width per query head, column and partition).
 
 ## How to use
 {% if functions %}
