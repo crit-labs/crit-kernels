@@ -13,16 +13,17 @@ from ._ops import ops
 from .triton_gemv import MAX_ROWS as TRITON_ROWS, decode, decode_fp8, gemv_triton, hardware
 
 CUDA_ROWS = 16   # rows the CUDA GEMVs take in one call
-MAX_ROWS = TRITON_ROWS
 
-__all__ = ["CUDA_ROWS", "TRITON_ROWS", "MAX_ROWS", "gemv", "gemv_fp8", "gemv_bf16", "gemv_triton", "decode",
+__all__ = ["CUDA_ROWS", "TRITON_ROWS", "gemv", "gemv_fp8", "gemv_bf16", "gemv_triton", "decode",
            "decode_fp8", "hardware_decode", "hardware"]
 
 
-def gemv(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, inverse: torch.Tensor, out: torch.Tensor):
+def gemv(x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, inverse: torch.Tensor, out: torch.Tensor,
+         blocked: bool = False):
     """out [M][N] (FP32 or x's dtype) = x [M][K] (M 1..16, BF16 or FP16, rows on 16-byte boundaries, K a multiple of
-    32) times the NVFP4 matrix, on CUDA cores."""
-    ops.gemv(x, codes, scales, inverse, out)
+    32) times the NVFP4 matrix, on CUDA cores. blocked: the E4M3 block scales are in cuBLASLt's 128 x 4 tiled layout
+    (what its block-scaled GEMM reads; rows padded to 128, blocks to 4) instead of row major [N][K / 16]."""
+    ops.gemv(x, codes, scales, inverse, blocked, out)
     return out
 
 

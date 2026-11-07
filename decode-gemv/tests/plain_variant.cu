@@ -10,7 +10,7 @@ namespace nr = crit::kernels::decode_gemv;
 void gemv(torch::Tensor x, torch::Tensor codes, torch::Tensor scales, torch::Tensor inverse, torch::Tensor out) {
   TORCH_CHECK(nr::enqueue_gemv(x.data_ptr(), static_cast<int>(x.stride(0)), x.scalar_type() == at::kBFloat16,
                                codes.data_ptr<std::uint8_t>(), reinterpret_cast<const std::uint8_t*>(scales.data_ptr()),
-                               inverse.data_ptr<float>(), out.data_ptr(), static_cast<int>(out.stride(0)),
+                               false, inverse.data_ptr<float>(), out.data_ptr(), static_cast<int>(out.stride(0)),
                                out.scalar_type() == at::kFloat, static_cast<int>(x.size(0)),
                                static_cast<int>(codes.size(0)), static_cast<int>(x.size(1)),
                                at::cuda::getCurrentCUDAStream()) == cudaSuccess,

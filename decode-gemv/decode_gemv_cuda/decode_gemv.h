@@ -26,8 +26,9 @@ namespace crit::kernels::decode_gemv {
 
 constexpr int kMaxRows = 16;
 
+// blocked: the scales are in cuBLASLt's 128 x 4 tiled layout (rows padded to 128, blocks to 4) instead of row major.
 cudaError_t enqueue_gemv(const void* x, int ldx, bool x_bf16, const std::uint8_t* codes, const std::uint8_t* scales,
-                         const float* inverse, void* out, int ldo, bool out_fp32, int M, int N, int K,
+                         bool blocked, const float* inverse, void* out, int ldo, bool out_fp32, int M, int N, int K,
                          cudaStream_t stream);
 
 cudaError_t enqueue_gemv_fp8(const void* x, int ldx, bool x_bf16, const std::uint8_t* codes, const float* row_scale,

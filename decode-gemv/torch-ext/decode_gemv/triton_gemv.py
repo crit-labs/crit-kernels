@@ -40,11 +40,14 @@ def _e2m1(codes):
     return bits.to(tl.float16, bitcast=True).to(tl.float32)
 
 
-# Tiles (rows per program, columns per step, warps) the GEMV picks from by measuring them on the device, once per
-# matrix shape (N, K): never per row count, so a row reduces in the same order alone and in a batch.
-GEMV_TILES = [triton.Config({"BLOCK_N": n, "BLOCK_K": k}, num_warps=w)
-              for n, k, w in ((8, 512, 4), (4, 1024, 4), (4, 512, 2), (16, 512, 8), (8, 256, 4), (16, 256, 4),
-                              (4, 256, 2), (8, 1024, 8), (2, 1024, 2), (32, 256, 8))]
+# The columns a step takes: one for every shape, so the order a row's sum takes (one FP32 sum per 16-value block of the
+# step, carried over the K loop, the blocks added once at the end) never depends on what the autotuner picks.
+BLOCK_K = 512
+# Tiles (rows per program, warps) the GEMV picks from by measuring them on the device, once per matrix shape (N, K):
+# never per row count. They choose which rows a program computes, never a row's order: tests check every one gives the
+# same bits.
+GEMV_TILES = [triton.Config({"BLOCK_N": n, "BLOCK_K": BLOCK_K}, num_warps=w)
+              for n, w in ((2, 2), (4, 2), (4, 4), (8, 4), (8, 8), (16, 4), (16, 8), (32, 8))]
 
 
 @triton.jit

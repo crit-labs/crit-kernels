@@ -4,7 +4,7 @@
 #include "torch_binding.h"
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  ops.def("gemv(Tensor x, Tensor codes, Tensor scales, Tensor inverse, Tensor! out) -> ()");
+  ops.def("gemv(Tensor x, Tensor codes, Tensor scales, Tensor inverse, bool blocked, Tensor! out) -> ()");
   ops.def("gemv_fp8(Tensor x, Tensor codes, Tensor scales, Tensor! out) -> ()");
   ops.def("gemv_bf16(Tensor x, Tensor w, Tensor! out) -> ()");
   ops.def("hardware_decode(Tensor device_of) -> int");

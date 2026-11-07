@@ -73,12 +73,20 @@ __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float v) { re
 template <>
 __device__ __forceinline__ __half from_float<__half>(float v) { return __float2half_rn(v); }
 
+// The byte of block j (an even j: blocks j and j + 1 are adjacent in both layouts) of row n's E4M3 scales: row major
+// [N][ks], or cuBLASLt's 128 x 4 tiled layout with ct tiles of 4 blocks a row of tiles (rows padded to 128).
+__device__ __forceinline__ size_t scale_offset(int n, int j, int ks, int ct) {
+  if (!ct) return (size_t)n * ks + j;
+  const int r = n & 127;
+  return ((size_t)(n >> 7) * ct + (j >> 2)) * 512 + (size_t)(r & 31) * 16 + (r >> 5) * 4 + (j & 3);
+}
+
 template <int M, int ROWS, typename X, typename O>
 __global__ void __launch_bounds__(WARPS * 32) gemv_kernel(const X* __restrict__ x, int ldx,
                                                           const uint8_t* __restrict__ codes,
                                                           const uint8_t* __restrict__ scales,
                                                           const float* __restrict__ inverse, O* __restrict__ out,
-                                                          int ldo, int N, int K) {
+                                                          int ldo, int N, int K, int ct) {
   const int lane = threadIdx.x & 31;
   const int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * ROWS;
   if (row0 >= N) return;
@@ -95,7 +103,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_kernel(const X* __restrict__ 
     for (int r = 0; r < ROWS; ++r) {
       const int n = min(row0 + r, N - 1);   // a row past N reads row N - 1 and writes nothing
       wv[r] = __ldg(reinterpret_cast<const uint4*>(codes + (size_t)n * kb + off));
-      sv[r] = __ldg(reinterpret_cast<const uint16_t*>(scales + (size_t)n * ks + (off >> 3)));
+      sv[r] = __ldg(reinterpret_cast<const uint16_t*>(scales + scale_offset(n, off >> 3, ks, ct)));
     }
     const int k = off * 2;
     // The lane's four words in element order, 8 codes each (two to a scale block): each row's sums take the same
@@ -143,29 +151,29 @@ int multiprocessors() {
 
 template <int M, int ROWS, typename X, typename O>
 void launch_rows(const void* x, int ldx, const uint8_t* codes, const uint8_t* scales, const float* inverse, void* out,
-                 int ldo, int N, int K, cudaStream_t stream) {
+                 int ldo, int N, int K, int ct, cudaStream_t stream) {
   const int blocks = (N + ROWS * WARPS - 1) / (ROWS * WARPS);
   gemv_kernel<M, ROWS, X, O><<<blocks, WARPS * 32, 0, stream>>>(reinterpret_cast<const X*>(x), ldx, codes, scales,
-                                                               inverse, reinterpret_cast<O*>(out), ldo, N, K);
+                                                               inverse, reinterpret_cast<O*>(out), ldo, N, K, ct);
 }
 
 // Rows a warp takes, a choice of speed and never of a row's order: more at more activation rows (each activation
 // converted once for them all), fewer where the matrix would not give the device two blocks a multiprocessor.
 template <int M, typename X, typename O>
 void launch(const void* x, int ldx, const uint8_t* codes, const uint8_t* scales, const float* inverse, void* out,
-            int ldo, int N, int K, cudaStream_t stream) {
+            int ldo, int N, int K, int ct, cudaStream_t stream) {
   constexpr int MORE = M <= 2 ? 2 : M <= 4 ? 4 : M <= 8 ? 8 : 4;
   constexpr int FEWER = MORE == 2 ? 2 : MORE / 2;
   if ((N + MORE * WARPS - 1) / (MORE * WARPS) >= 2 * multiprocessors())
-    launch_rows<M, MORE, X, O>(x, ldx, codes, scales, inverse, out, ldo, N, K, stream);
+    launch_rows<M, MORE, X, O>(x, ldx, codes, scales, inverse, out, ldo, N, K, ct, stream);
   else
-    launch_rows<M, FEWER, X, O>(x, ldx, codes, scales, inverse, out, ldo, N, K, stream);
+    launch_rows<M, FEWER, X, O>(x, ldx, codes, scales, inverse, out, ldo, N, K, ct, stream);
 }
 
 template <typename X, typename O>
 bool dispatch(int M, const void* x, int ldx, const uint8_t* codes, const uint8_t* scales, const float* inverse,
-              void* out, int ldo, int N, int K, cudaStream_t stream) {
-#define CALL(m) launch<m, X, O>(x, ldx, codes, scales, inverse, out, ldo, N, K, stream)
+              void* out, int ldo, int N, int K, int ct, cudaStream_t stream) {
+#define CALL(m) launch<m, X, O>(x, ldx, codes, scales, inverse, out, ldo, N, K, ct, stream)
   switch (M) {
 #define CRIT_ROWS_CASE(m) case m: CALL(m); return true;
     CRIT_ROWS_CASE(1) CRIT_ROWS_CASE(2) CRIT_ROWS_CASE(3) CRIT_ROWS_CASE(4) CRIT_ROWS_CASE(5) CRIT_ROWS_CASE(6)
@@ -368,16 +376,17 @@ __global__ void hardware_kernel(int* out) { *out = CRIT_E2M1_HW; }
 }  // namespace
 
 cudaError_t enqueue_gemv(const void* x, int ldx, bool x_bf16, const std::uint8_t* codes, const std::uint8_t* scales,
-                         const float* inverse, void* out, int ldo, bool out_fp32, int M, int N, int K,
+                         bool blocked, const float* inverse, void* out, int ldo, bool out_fp32, int M, int N, int K,
                          cudaStream_t stream) {
+  const int ct = blocked ? ((K >> 4) + 3) / 4 : 0;
   if (M < 1 || M > kMaxRows || N < 1 || K < 32 || K % 32) return cudaErrorInvalidValue;
   bool ok;
   if (out_fp32) {
-    ok = x_bf16 ? dispatch<__nv_bfloat16, float>(M, x, ldx, codes, scales, inverse, out, ldo, N, K, stream)
-                : dispatch<__half, float>(M, x, ldx, codes, scales, inverse, out, ldo, N, K, stream);
+    ok = x_bf16 ? dispatch<__nv_bfloat16, float>(M, x, ldx, codes, scales, inverse, out, ldo, N, K, ct, stream)
+                : dispatch<__half, float>(M, x, ldx, codes, scales, inverse, out, ldo, N, K, ct, stream);
   } else {
-    ok = x_bf16 ? dispatch<__nv_bfloat16, __nv_bfloat16>(M, x, ldx, codes, scales, inverse, out, ldo, N, K, stream)
-                : dispatch<__half, __half>(M, x, ldx, codes, scales, inverse, out, ldo, N, K, stream);
+    ok = x_bf16 ? dispatch<__nv_bfloat16, __nv_bfloat16>(M, x, ldx, codes, scales, inverse, out, ldo, N, K, ct, stream)
+                : dispatch<__half, __half>(M, x, ldx, codes, scales, inverse, out, ldo, N, K, ct, stream);
   }
   return ok ? cudaGetLastError() : cudaErrorInvalidValue;
 }

@@ -251,3 +251,68 @@ def test_the_fp8_gemv_refuses_what_it_cannot_read():
         nr.gemv_fp8(activations(2, 256), cm, sm[:, :4], out)      # an exponent per 32 inputs
     with pytest.raises(RuntimeError):
         nr.gemv_fp8(activations(2, 256).float(), c, s, out)      # 16-bit activations
+
+
+@pytest.mark.kernels_ci
+def test_every_triton_tile_gives_the_same_bits():
+    """The autotuner picks a tile per shape by timing it: every tile it may pick gives the same bits, so two processes
+    agree whatever they picked."""
+    module = sys.modules[nr.gemv_triton.__module__]
+    c, s, i = matrix(130, 2048)
+    x = activations(8, 2048)
+    found = []
+    for config in module.GEMV_TILES:
+        out = torch.empty(8, 130, device=dev)
+        hw = module.hardware(dev)
+        module._gemv_kernel.fn[(triton_cdiv(130, config.kwargs["BLOCK_N"]),)](
+            x, c, s, i, out, 130, 2048, x.stride(0), out.stride(0), M=8, HW=hw, num_warps=config.num_warps,
+            **config.kwargs)
+        found.append(out)
+    for out in found[1:]:
+        assert torch.equal(out, found[0])
+
+
+def triton_cdiv(a, b):
+    return (a + b - 1) // b
+
+
+def to_blocked(scales):
+    """[rows][blocks] scale bytes in cuBLASLt's 128 x 4 tiled layout (rows padded to 128, blocks to 4)."""
+    rows, cols = scales.shape
+    rt, ct = -(-rows // 128), -(-cols // 4)
+    padded = torch.zeros(rt * 128, ct * 4, dtype=scales.dtype, device=scales.device)
+    padded[:rows, :cols] = scales
+    tiles = padded.view(rt, 128, ct, 4).permute(0, 2, 1, 3)
+    return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("shape", [(96, 256), (130, 2080), (1000, 5120)])
+def test_blocked_scales_give_the_row_major_bits(shape):
+    n, k = shape
+    c, s, i = matrix(n, k)
+    x = activations(16, k)
+    blocked = to_blocked(s.view(torch.uint8))
+    for rows in (1, 5, 16):
+        want = nvfp4_gemv(x[:rows], c, s, i)
+        found = torch.empty_like(want)
+        nr.gemv(x[:rows], c, blocked, i, found, blocked=True)
+        assert torch.equal(found, want), (shape, rows)
+    with pytest.raises(RuntimeError):
+        nr.gemv(x[:2], c, blocked[:-4], i, torch.empty(2, n, device=dev), blocked=True)
+
+
+@pytest.mark.kernels_ci
+def test_tensors_on_another_device_or_misaligned_are_refused():
+    c, s, i = matrix(96, 256)
+    x = activations(2, 256)
+    out = torch.empty(2, 96, device=dev)
+    with pytest.raises(RuntimeError):
+        nr.gemv(x, c, s, i.cpu(), out)
+    odd = torch.empty(96 * 16 + 1, dtype=torch.uint8, device=dev)[1:].view(96, 16)
+    odd.copy_(s.view(torch.uint8))
+    with pytest.raises(RuntimeError):
+        nr.gemv(x, c, odd, i, out)                       # scales read two bytes at a time
+    fc, fs = fp8_matrix(96, 256, False)
+    with pytest.raises(RuntimeError):
+        nr.gemv_fp8(x, fc, fs.cpu(), out)
