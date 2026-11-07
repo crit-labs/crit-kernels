@@ -53,9 +53,12 @@ prefill), 2.03 ms for eight decode rows.
 (FlashInfer: 276 us decode, 294 for 4 columns, 347 for 8). 56 query / 8 KV heads x 128, INT8 pages with a scale per
 position and head: 15.3 us at 4K, 349 us at 200K, 522 us for 5 columns.
 
-On sm_90, sm_100 and sm_110 a window of more than 32 query rows is read by several 32-row tiles, each reading the row's
-pages again (about the tile count times a tile's time: on sm_120 the 5-column BF16 window above took 670 us that
-way). Wide windows at short contexts over many rows are bound by the partials (FP32, value width per query head,
+On sm_90, sm_100 and sm_110 a window of more than 32 query rows keeps the cost of 32-row tiles: it is read by several
+of them, each reading the row's pages again (about the tile count times a tile's time: on sm_120 the 5-column BF16
+window above took 670 us that way). The reason: their tensor cores take four warps over 64 rows as warpgroup MMA
+(sm_90's wgmma, sm_100's and sm_110's tcgen05), another summation order than the mma.sync of the decode tiles, so a
+64-row tile there would give a window's column other bits than the same column decoded alone; a two-warp 64-row tile
+stays mma.sync but runs about 2x slower, and two 32-row dots in four warps spill. Wide windows at short contexts over many rows are bound by the partials (FP32, value width per query head,
 column and partition).
 
 ## How to use

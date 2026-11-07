@@ -342,9 +342,11 @@ def test_e4m3_decoded_in_software_equals_the_hardware_conversion(monkeypatch):
 
 @pytest.mark.kernels_ci
 def test_work_follows_the_rows_length_not_the_capacity():
+    # No timing (the tests share the GPU): one graph over a 200K-position table, replayed at a long and then a short
+    # length with every position past it poisoned first (NaN scales): a read of any of them would make the output NaN
+    # or move it, so a replay reads the row's own positions only, whatever the table holds.
     cache = Cache("fp8:row", 4, 256, 256, 64, [200_000])
     q = _q(1, 24, 256, 1).to(torch.bfloat16)
-
     firsts = torch.tensor([0], device=dev)
     args = (q, cache.k, cache.v, "fp8:row", cache.tables, torch.zeros(1, dtype=torch.int32, device=dev),
             torch.zeros(1, dtype=torch.int32, device=dev), firsts, 1, 64)
@@ -352,21 +354,16 @@ def test_work_follows_the_rows_length_not_the_capacity():
     pk.attend(*args, **kw)
     graph = torch.cuda.CUDAGraph()      # one graph, its work read from the row's length on the device
     with torch.cuda.graph(graph):
-        pk.attend(*args, **kw)
-
-    def timed(first):
+        out = pk.attend(*args, **kw)
+    for first in (199_000, 4_000):
         firsts.fill_(first)
-        for _ in range(3):
-            graph.replay()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(20):
-            graph.replay()
-        end.record()
-        end.synchronize()
-        return start.elapsed_time(end) / 20
-    short, long = timed(4_000), timed(199_000)
-    assert long > 8 * short, (short, long)
+        want = pk.attend(*args, **kw)
+        past = cache.slots(0, torch.arange(first + 1, 200_000, device=dev))
+        cache.ks.view(-1, 4)[past] = float("nan")
+        cache.vs.view(-1, 4)[past] = float("nan")
+        graph.replay()
+        assert bool(torch.isfinite(out).all()), first
+        assert torch.equal(out, want), first
 
 
 @pytest.mark.kernels_ci
