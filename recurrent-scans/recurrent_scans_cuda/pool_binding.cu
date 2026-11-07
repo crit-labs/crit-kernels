@@ -32,7 +32,8 @@ rk::Scalar scalar_of(const torch::Tensor& t) {
     }
 }
 
-// A step's rows (meta [rows][4] int32) or a round's (starts [rows + 1] int32, slots [rows] int64, table int32).
+// A step's rows (meta [rows][5] int32) or a round's (starts [rows + 1] int32, slots [rows] int64, table int32 of at
+// least `rows` slots: a round's rows are slots 0 .. rows - 1).
 rk::RowSource source_of(const std::optional<torch::Tensor>& meta, const std::optional<torch::Tensor>& starts,
                         const std::optional<torch::Tensor>& slots, const std::optional<torch::Tensor>& table, int64_t rows,
                         int64_t kind) {
@@ -42,7 +43,7 @@ rk::RowSource source_of(const std::optional<torch::Tensor>& meta, const std::opt
     TORCH_CHECK(rows >= 0 && rows <= 65535, "rows must be 0 .. 65535");
     if(meta) {
         check_contiguous(*meta, "meta", torch::kInt32, 2);
-        TORCH_CHECK(meta->size(0) >= rows && meta->size(1) == 4, "meta must be [rows][4]");
+        TORCH_CHECK(meta->size(0) >= rows && meta->size(1) == 5, "meta must be [rows][5]");
         s.meta = meta->data_ptr<std::int32_t>();
         return s;
     }
@@ -50,6 +51,7 @@ rk::RowSource source_of(const std::optional<torch::Tensor>& meta, const std::opt
     check_on(*slots, "slots", torch::kInt64, 1);
     check_contiguous(*table, "table", torch::kInt32, 1);
     TORCH_CHECK(slots->stride(0) == 1 && slots->size(0) >= rows, "slots must be [rows], contiguous");
+    TORCH_CHECK(table->size(0) >= rows, "the slot table must hold the round's ", rows, " rows' slots");
     s.slots = slots->data_ptr<std::int64_t>();
     s.table = table->data_ptr<std::int32_t>();
     if(starts) {
@@ -111,9 +113,13 @@ void pool_delta(torch::Tensor& out, torch::Tensor& states, torch::Tensor& stash,
     p.states += layer * p.state_layer;
     p.stash += layer * p.stash_layer;
     p.control += layer * p.control_layer;
-    if(scratch) {
+    const int64_t S = states.size(2) * states.size(3) * states.size(4);
+    if(scratch) {   // a slot: (capacity + 1) states for a round's checkpoints, else one
         TORCH_CHECK(scratch->is_cuda() && scratch->scalar_type() == torch::kFloat32 && scratch->dim() >= 2 &&
                     scratch->is_contiguous(), "scratch must be a contiguous float32 [slots][...] tensor");
+        const int64_t per = (!meta && kind == rk::kCheckpoints) ? (capacity + 1) * S : S;
+        TORCH_CHECK(scratch->stride(0) >= per, "scratch must hold ", per, " floats per slot");
+        TORCH_CHECK(meta || scratch->size(0) >= rows, "scratch must hold a slot per round row");
         p.scratch = scratch->data_ptr<float>();
         p.scratch_slot = scratch->stride(0);
     }
@@ -130,6 +136,8 @@ void pool_delta(torch::Tensor& out, torch::Tensor& states, torch::Tensor& stash,
     check_on(out, "out", torch::kFloat32, 3);
     TORCH_CHECK(out.size(1) == d.v_heads && out.size(2) == d.dv && out.stride(2) == 1 && out.stride(1) == d.dv,
                 "out must be [T][value heads][dv], heads contiguous within a row");
+    TORCH_CHECK(out.size(0) == q.size(0) && log_decay.size(0) == q.size(0) && beta.size(0) == q.size(0),
+                "out, log_decay and beta must have q's ", q.size(0), " rows");
     rk::RowInputs in;
     in.q = q.data_ptr();
     in.k = k.data_ptr();
@@ -164,10 +172,12 @@ void pool_delta_replay(torch::Tensor& states, torch::Tensor& stash, torch::Tenso
     const c10::cuda::CUDAGuard guard(states.device());
     const rk::DeltaShape d = shape_of(states, key_heads);
     rk::PoolDelta p = pool_of(d, states, stash, control, capacity);
-    if(scratch) {   // [layers][slots][...]
+    if(scratch) {   // [layers][slots][...]: a start state per slot
         TORCH_CHECK(scratch->is_cuda() && scratch->scalar_type() == torch::kFloat32 && scratch->dim() >= 3 &&
                     scratch->is_contiguous() && scratch->size(0) == states.size(0),
                     "scratch must be a contiguous float32 [layers][slots][...] tensor");
+        TORCH_CHECK(scratch->stride(1) >= states.size(2) * states.size(3) * states.size(4) && (meta || scratch->size(1) >= rows),
+                    "scratch must hold a start state per round row");
         p.scratch = scratch->data_ptr<float>();
         p.scratch_layer = scratch->stride(0);
         p.scratch_slot = scratch->stride(1);
@@ -190,6 +200,7 @@ rk::ConvInputs conv_inputs(torch::Tensor& out, const torch::Tensor& x, const tor
     TORCH_CHECK(x.is_cuda() && out.is_cuda() && x.dim() == 2 && out.dim() == 2, "x and out must be [T][channels] CUDA tensors");
     TORCH_CHECK(out.scalar_type() == x.scalar_type() && out.size(0) == x.size(0) && out.size(1) == x.size(1),
                 "out must have x's shape and dtype");
+    TORCH_CHECK(x.numel() == 0 || out.data_ptr() != x.data_ptr(), "out must not be x");
     TORCH_CHECK(x.stride(1) == 1 && out.stride(1) == 1, "x and out rows must be contiguous");
     check_contiguous(weight, "weight", torch::kFloat32, 2);
     TORCH_CHECK(weight.size(0) == x.size(1) && weight.size(1) >= 2 && weight.size(1) <= 8, "weight must be [channels][2 .. 8]");
@@ -240,9 +251,10 @@ void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, 
     p.pending = pending.data_ptr<std::int32_t>() + layer * pending.stride(0);
     p.pending_sequence = pending.stride(1);
     p.pending_layer = pending.stride(0);
-    if(scratch) {
+    if(scratch) {   // a final window per slot
         TORCH_CHECK(scratch->is_cuda() && scratch->scalar_type() == torch::kFloat32 && scratch->is_contiguous() && scratch->dim() >= 2,
                     "scratch must be a contiguous float32 [slots][...] tensor");
+        TORCH_CHECK(scratch->stride(0) >= int64_t(c.channels) * (c.width - 1), "scratch must hold a window per slot");
         p.scratch = scratch->data_ptr<float>();
         p.scratch_slot = scratch->stride(0);
     }

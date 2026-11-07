@@ -15,9 +15,10 @@ def normal(x, eps):
     return x / torch.sqrt((x * x).sum(-1, keepdim=True) + eps)
 
 
-def reference(q, k, v, g, b, state, scale, eps=1e-6):
-    """float64 recurrence over raw q, k [T][kh][dk] (normalized here), v [T][vh][dv]; state [vh][dk][dv]."""
-    q, k = normal(q.double(), eps), normal(k.double(), eps)
+def reference(q, k, v, g, b, state, scale, eps=1e-6, normalize=(True, True)):
+    """float64 recurrence over raw q, k [T][kh][dk] (normalized here where asked), v [T][vh][dv]; state [vh][dk][dv]."""
+    k = normal(k.double(), eps) if normalize[0] else k.double()
+    q = normal(q.double(), eps) if normalize[1] else q.double()
     v, g, b, S = v.double(), g.double(), b.double(), state.double().clone()
     vh, kh = v.shape[1], q.shape[1]
     out = torch.empty(v.shape, dtype=torch.float64, device=v.device)
@@ -43,12 +44,13 @@ class Pool:
         self.starts = torch.zeros(layers, slots, vh * dk * dv, device=dev)
         self.table = torch.full((slots,), -1, dtype=torch.int32, device=dev)
 
-    def rows(self, layer, q, k, v, g, b, rows, scale, scratch=None):
-        """rows: (first, tokens, sequence, kind)."""
-        meta = torch.tensor(rows, dtype=torch.int32, device=dev)
+    def rows(self, layer, q, k, v, g, b, rows, scale, scratch=None, epsilon=1e-6, normalize=(True, True)):
+        """rows: (first, tokens, sequence, kind[, scratch slot])."""
+        meta = torch.tensor([list(r) + [-1] * (5 - len(r)) for r in rows], dtype=torch.int32, device=dev)
         out = torch.zeros(v.shape, device=dev)
         rs.pool_delta(out, self.states, self.stash, self.control, scratch, q, k, v, g, b, meta=meta, rows=len(rows),
-                      kind=0, layer=layer, capacity=self.capacity, scale=scale)
+                      kind=0, layer=layer, capacity=self.capacity, epsilon=epsilon, scale=scale,
+                      normalize_keys=normalize[0], normalize_queries=normalize[1])
         return out
 
     def record(self, accepted, sequences):
@@ -58,7 +60,7 @@ class Pool:
             self.control[:, s, :blocks] = n
 
     def flush(self, sequences):
-        meta = torch.tensor([[0, 0, s, 4] for s in sequences], dtype=torch.int32, device=dev)
+        meta = torch.tensor([[0, 0, s, 4, -1] for s in sequences], dtype=torch.int32, device=dev)
         rs.pool_delta_replay(self.states, self.stash, self.control, None, None, meta=meta, rows=len(sequences),
                              capacity=self.capacity, key_heads=self.shape[0], mode=rs.FLUSH_PENDING)
 
@@ -279,14 +281,14 @@ def test_pool_convolution_keeps_each_sequences_window(width, dtype):
     stash = torch.zeros(1, 3, cap, C, device=dev)
     pending = torch.zeros(1, 3, rs.pool_conv_blocks(C), dtype=torch.int32, device=dev)
     out = torch.zeros_like(x)
-    meta = torch.tensor([[0, 3, 2, rs.STASH], [3, 2, 0, rs.STASH]], dtype=torch.int32, device=dev)
+    meta = torch.tensor([[0, 3, 2, rs.STASH, -1], [3, 2, 0, rs.STASH, -1]], dtype=torch.int32, device=dev)
     rs.pool_conv(out, window, stash, pending, None, x, weight, bias, meta=meta, rows=2, capacity=cap)
     ref, ref_window = conv_reference(x[:3].float(), weight, bias, start)
     torch.testing.assert_close(out[:3].double(), ref.to(dtype).double(), rtol=1e-2 if dtype != torch.float32 else 1e-5,
                                atol=1e-2 if dtype != torch.float32 else 1e-5)
     assert torch.equal(window[0, 2], start)   # pending until committed
     pending[0, 2] = 2   # accept 2 of the 3 inputs
-    flush = torch.tensor([[0, 0, 2, rs.FLUSH]], dtype=torch.int32, device=dev)
+    flush = torch.tensor([[0, 0, 2, rs.FLUSH, -1]], dtype=torch.int32, device=dev)
     rs.pool_conv(out[:0], window, stash, pending, None, x[:0], weight, bias, meta=flush, rows=1, capacity=cap)
     _, expected = conv_reference(x[:2].float(), weight, bias, start)
     torch.testing.assert_close(window[0, 2].double(), expected, rtol=0, atol=0)
@@ -296,7 +298,7 @@ def test_pool_convolution_keeps_each_sequences_window(width, dtype):
     rs.conv_segments(seg_out, window[0, 2].clone(), seg_window, long, weight, bias)
     scratch = torch.zeros(1, C, width - 1, device=dev)
     row_out = torch.empty_like(long)
-    meta = torch.tensor([[0, 70, 2, rs.FINAL]], dtype=torch.int32, device=dev)
+    meta = torch.tensor([[0, 70, 2, rs.FINAL, 0]], dtype=torch.int32, device=dev)
     rs.pool_conv(row_out, window, stash, pending, scratch, long, weight, bias, meta=meta, rows=1, capacity=cap)
     assert torch.equal(seg_out, row_out) and torch.equal(seg_window, scratch[0])
     # rows shorter than the window
@@ -305,3 +307,73 @@ def test_pool_convolution_keeps_each_sequences_window(width, dtype):
     rs.conv_segments(s_out, window[0, 2].clone(), s_window, short, weight, bias)
     _, expected = conv_reference(short.float(), weight, bias, window[0, 2])
     torch.testing.assert_close(s_window.double(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("variant", ["no-norm-keys", "no-norm-queries", "epsilon", "fp16"])
+def test_geometry_variants_match_the_recurrence(variant):
+    kh, vh, dk, dv = 2, 4, 64, 64
+    normalize = (variant != "no-norm-keys", variant != "no-norm-queries")
+    eps = 1e-3 if variant == "epsilon" else 1e-6
+    dtype = torch.float16 if variant == "fp16" else torch.float32
+    q, k, v, g, b = inputs(6, kh, vh, dk, dv, seed=21, dtype=dtype)
+    if not normalize[0]:
+        k = (k.float() / (k.float().norm(dim=-1, keepdim=True) * 2)).to(dtype)   # keys of norm 1/2 keep the state bounded
+    pool = Pool(1, 2, kh, vh, dk, dv, capacity=6)
+    out = pool.rows(0, q, k, v, g, b, [(0, 6, 1, rs.STASH)], 0.3, epsilon=eps, normalize=normalize)
+    pool.record([6], [1])
+    pool.flush([1])
+    ref_out, ref_state = reference(q.float(), k.float(), v.float(), g, b, torch.zeros(vh, dk, dv, device=dev), 0.3, eps,
+                                   normalize)
+    torch.testing.assert_close(out.double(), ref_out, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(pool.states[0, 1].double(), ref_state, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.kernels_ci
+def test_final_rows_keep_the_state_after_their_last_token_in_their_scratch_slot():
+    kh, vh, dk, dv = 1, 2, 32, 32
+    q, k, v, g, b = inputs(11, kh, vh, dk, dv, seed=23)
+    pool = Pool(1, 3, kh, vh, dk, dv, capacity=2)
+    S = vh * dk * dv
+    scratch = torch.full((2, S), float("nan"), device=dev)
+    before = pool.states.clone()
+    # a decode row, then two FINAL rows in scratch slots 1 and 0 (the slots need not follow the rows)
+    out = pool.rows(0, q, k, v, g, b, [(0, 1, 0, rs.STASH, -1), (1, 4, 1, rs.FINAL, 1), (5, 6, 2, rs.FINAL, 0)], 0.25,
+                    scratch=scratch)
+    assert torch.equal(pool.states, before)   # FINAL rows leave the live state untouched
+    for first, count, seq, slot in ((1, 4, 1, 1), (5, 6, 2, 0)):
+        rows = slice(first, first + count)
+        ref_out, ref_state = reference(q[rows], k[rows], v[rows], g[rows], b[rows], torch.zeros(vh, dk, dv, device=dev), 0.25)
+        torch.testing.assert_close(out[rows].double(), ref_out, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(scratch[slot].view(vh, dk, dv).double(), ref_state, rtol=1e-4, atol=1e-5)
+    # a FINAL row without scratch writes zeros and touches nothing
+    out = pool.rows(0, q, k, v, g, b, [(0, 4, 1, rs.FINAL, -1)], 0.25, scratch=None)
+    assert torch.equal(out[:4], torch.zeros_like(out[:4])) and torch.equal(pool.states, before)
+
+
+@pytest.mark.kernels_ci
+def test_a_flush_of_more_rows_by_layers_than_a_grid_dimension_holds():
+    layers, sequences = 48, 1400   # rows x layers past 65,535
+    pool = Pool(layers, sequences, 1, 1, 4, 4, capacity=1)
+    pool.stash.normal_()
+    pool.control[:, :, 0] = 1   # every block of every sequence: one pending step
+    before = pool.states.clone()
+    pool.flush(list(range(sequences)))
+    torch.cuda.synchronize()
+    assert int(pool.control[:, :, 0].abs().sum()) == 0 and not torch.equal(pool.states, before)
+    window = torch.zeros(layers, sequences, 8, 3, device=dev)
+    stash = torch.randn(layers, sequences, 1, 8, device=dev)
+    pending = torch.ones(layers, sequences, 1, dtype=torch.int32, device=dev)
+    meta = torch.tensor([[0, 0, s, rs.FLUSH, -1] for s in range(sequences)], dtype=torch.int32, device=dev)
+    x = torch.zeros(0, 8, device=dev)
+    rs.pool_conv(torch.zeros(0, 8, device=dev), window, stash, pending, None, x, torch.zeros(8, 4, device=dev), meta=meta,
+                 rows=sequences, kind=rs.FLUSH, layer=0, layers=layers, capacity=1)
+    torch.cuda.synchronize()
+    assert int(pending.sum()) == 0 and torch.equal(window[:, :, :, 2], stash[:, :, 0])
+
+
+@pytest.mark.kernels_ci
+def test_a_convolution_into_its_own_input_is_refused():
+    x = torch.randn(4, 8, device=dev)
+    with pytest.raises(RuntimeError, match="out must not be x"):
+        rs.conv_segments(x, torch.zeros(8, 3, device=dev), torch.zeros(8, 3, device=dev), x, torch.zeros(8, 4, device=dev))

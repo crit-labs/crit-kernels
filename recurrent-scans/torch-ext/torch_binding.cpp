@@ -12,12 +12,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("ssd_prefill(Tensor! out, Tensor! state, Tensor x, Tensor dt, Tensor B, Tensor C, Tensor A, Tensor? D) -> ()");
   ops.def("ssd_scan(Tensor! out, Tensor! state, Tensor x, Tensor dt, Tensor B, Tensor C, Tensor A, Tensor? D, "
           "Tensor? checkpoints) -> ()");
-  ops.def("pool_delta(Tensor! out, Tensor! states, Tensor! stash, Tensor! control, Tensor? scratch, Tensor q, Tensor k, "
+  ops.def("pool_delta(Tensor! out, Tensor! states, Tensor! stash, Tensor! control, Tensor(a!)? scratch, Tensor q, Tensor k, "
           "Tensor v, Tensor log_decay, Tensor beta, Tensor? meta, Tensor? starts, Tensor? slots, Tensor? table, int rows, "
           "int kind, int layer, int capacity, float epsilon, float scale, bool normalize_keys, bool normalize_queries) -> ()");
   ops.def("pool_delta_replay(Tensor! states, Tensor! stash, Tensor! control, Tensor? scratch, Tensor? accepted, "
           "Tensor? meta, Tensor? slots, Tensor? table, int rows, int columns, int capacity, int key_heads, int mode) -> ()");
-  ops.def("pool_conv(Tensor! out, Tensor! window, Tensor! stash, Tensor! pending, Tensor? scratch, Tensor x, "
+  ops.def("pool_conv(Tensor! out, Tensor! window, Tensor! stash, Tensor! pending, Tensor(a!)? scratch, Tensor x, "
           "Tensor weight, Tensor? bias, Tensor? meta, Tensor? starts, Tensor? slots, Tensor? table, int rows, int kind, "
           "int layer, int layers, int capacity, bool silu) -> ()");
   ops.def("conv_segments(Tensor! out, Tensor window_in, Tensor! window_out, Tensor x, Tensor weight, Tensor? bias, "

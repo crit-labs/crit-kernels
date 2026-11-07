@@ -97,10 +97,11 @@ def pool_delta(out, states, stash, control, scratch, q, k, v, log_decay, beta, m
                normalize_queries=True):
     """One layer's rows: each row continues its sequence's state (states[layer][sequence], after its pending count)
     over its tokens; out [T][v_heads][dv] FP32. q, k [T][k_heads][dk] and v [T][v_heads][dv] in FP32, BF16 or FP16
-    (rows contiguous), log_decay and beta [T][v_heads] FP32. Rows from meta ([rows][4] int32: first token, tokens,
-    sequence or -1, kind) or a round's starts ([rows + 1] int32), slots ([rows] int64) and table ([slots] int32 ->
-    sequence or -1) with every row of `kind`. scratch [slots][...]: checkpoints [capacity + 1][state], or the start or
-    final state, by row (meta) or slot (round). Capture-safe."""
+    (rows contiguous), log_decay and beta [T][v_heads] FP32. Rows from meta ([rows][5] int32: first token, tokens,
+    sequence or -1, kind, scratch slot or -1) or a round's starts ([rows + 1] int32), slots ([rows] int64) and table
+    ([slots] int32 -> sequence or -1) with every row of `kind`. scratch [slots][...]: checkpoints [capacity + 1][state],
+    or the start or final state, by the meta row's scratch slot or the round slot; a FINAL, CHECKPOINTS or RECOMPUTE row
+    without scratch, and a row of no sequence, write zero outputs and touch no state. Capture-safe."""
     ops.pool_delta(out, states, stash, control, scratch, q, k, v, log_decay, beta, meta, starts, slots, table, rows, kind,
                    layer, capacity, epsilon, scale, normalize_keys, normalize_queries)
     return out
@@ -120,7 +121,7 @@ def pool_delta_replay(states, stash, control, scratch, accepted, meta=None, slot
 def pool_conv(out, window, stash, pending, scratch, x, weight, bias=None, meta=None, starts=None, slots=None, table=None,
               rows=0, kind=STASH, layer=0, layers=1, capacity=1, silu=True):
     """The causal depthwise convolution of rows over their sequences' windows (window[layer][sequence], after the
-    pending count): x and out [T][channels] (x's dtype; out may be x), weight [channels][width] FP32. STASH rows keep
+    pending count): x and out [T][channels] (x's dtype; out not x), weight [channels][width] FP32. STASH rows keep
     their inputs for the deferred commit, FINAL rows write the window after their last input to scratch [slots][...],
     FLUSH rows (over `layers` layers from `layer`) apply the pending count only. Capture-safe."""
     ops.pool_conv(out, window, stash, pending, scratch, x, weight, bias, meta, starts, slots, table, rows, kind, layer,

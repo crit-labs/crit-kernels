@@ -51,7 +51,8 @@ enum CommitMode : int { kReplay = 2, kFlushPending = 3 };
 // round's rows from device tensors the round driver owns (row r is tokens starts[r] .. starts[r + 1] - 1, sequence
 // table[slots[r]]; -1 skips the row: its outputs are zero, no state or window is read or written).
 struct RowSource {
-    const std::int32_t* meta = nullptr;     // [rows][4]: first token, tokens, sequence (-1: skip), kind
+    const std::int32_t* meta = nullptr;     // [rows][5]: first token, tokens, sequence (-1: skip), kind, scratch slot (-1:
+                                            // none; a FINAL, CHECKPOINTS or RECOMPUTE row without one writes zeros)
     const std::int32_t* starts = nullptr;   // [rows + 1]
     const std::int64_t* slots = nullptr;    // [rows]
     const std::int32_t* table = nullptr;    // [round slots] -> sequence
@@ -92,7 +93,8 @@ int pool_delta_blocks(const DeltaShape&);                           // v_heads *
 std::size_t pool_delta_half_floats(const DeltaShape&, int capacity);
 // One layer's rows (the pool's pointers at that layer). A stash row holds at most `capacity` tokens.
 cudaError_t enqueue_pool_delta(const DeltaShape&, const RowInputs&, const PoolDelta&, const RowSource&, cudaStream_t);
-// The replay of every row of `source` over `layers` layers (the pool's pointers at layer 0, layer strides set):
+// The replay of every row of `source` over `layers` layers (the pool's pointers at layer 0, layer strides set; a block
+// walks the layers, so any number of rows and layers fits one launch):
 // kReplay replays accepted[r] (clamped to 0 .. columns) stashed steps from the start state in the scratch into the live
 // state, kFlushPending applies and consumes each sequence's pending count (accepted unused).
 cudaError_t enqueue_pool_delta_replay(const DeltaShape&, const PoolDelta&, const RowSource&, int layers,
@@ -122,7 +124,8 @@ struct ConvInputs {
 };
 int pool_conv_blocks(int channels);
 // Rows of kStash (deferred window: apply the pending count, convolve from the window without writing it, stash the
-// inputs), kFinal (convolve, the window after the last input into the scratch) or kFlush, over `layers` layers.
+// inputs), kFinal (convolve, the window after the last input into the scratch) or kFlush, over `layers` layers (a block
+// walks them). out must not be x.
 cudaError_t enqueue_pool_conv(const ConvInputs&, const PoolConv&, const RowSource&, int layers, cudaStream_t);
 // One long row (a prompt chunk) out of place from window_in, writing window_out: a thread per (channel, 32 rows), the
 // same bits as the row kernel. out must not overlap x.

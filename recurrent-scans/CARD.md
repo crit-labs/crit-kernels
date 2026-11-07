@@ -26,16 +26,17 @@ and can write the state after every token (`checkpoints`), which speculative dec
 drafts. The pool rows add row invariance (a row's bits do not depend on the rows beside it) and one update expression on
 every path (verify, checkpoint, stash replay, recompute), so every commit strategy gives the same bits as decoding the
 accepted tokens one by one. Per-token decays are FP64 `exp` rounded once to FP32, so a decay near 1 does not drift the state over a long
-decode. Everything is FP32; the state is updated in place. Key dims 64 or 128, value dims a multiple of 64 (Mamba-2:
-d_state 64 or 128, head_dim a multiple of 32).
+decode. The state and the arithmetic are FP32. The single-sequence functions take FP32 inputs and update the state in
+place, with key dims 64 or 128 and value dims a multiple of 64 (Mamba-2: d_state 64 or 128, head_dim a multiple of 32);
+the pool rows take FP32, BF16 or FP16 inputs, key dims 1 to 256 and any value dim.
 
 Measured on one RTX 5090: the gated-delta prefill of a 2,048-token chunk at Qwen3.8-27B's shape (16 key and 48 value
 heads, dk = dv = 128) takes 1.38 ms per layer (1.32 ms measured again 2026-11-07, 5.2 ms per 8,192 tokens). At the same
 shape the pool rows take 5.4 us per layer for one sequence's decode token, 12.0 us for an 8-column verify row and
 56.4 us for 8 sequences x 8 columns (deferred commit; a 48-layer round of convolution, scan and commit captured as one
 CUDA graph: 0.51, 1.06 and 4.28 ms); per-column checkpoints cost up to 2.5x that, the recompute commit up to 1.7x. The
-tests compare every function with a float64 recurrence; tests/cuda holds the reference scans of the commit strategies
-and their CUDA fixture against crit's FP64 host oracle (cmake -S tests/cuda -DCRIT_ROOT=<a crit checkout>).
+tests compare every function with a float64 recurrence, and every commit strategy of the pool rows with decoding the
+accepted tokens one by one, bit for bit.
 
 ## How to use
 {% if functions %}

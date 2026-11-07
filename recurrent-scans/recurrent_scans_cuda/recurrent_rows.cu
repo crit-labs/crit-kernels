@@ -77,12 +77,12 @@ struct Row { int first, count, sequence, kind, slot; };
 __device__ __forceinline__ Row row_of(const RowSource& s, int r) {
     Row w;
     if(s.meta) {
-        const std::int32_t* m = s.meta + 4 * r;
+        const std::int32_t* m = s.meta + 5 * r;
         w.first = m[0];
         w.count = m[1];
         w.sequence = m[2];
         w.kind = m[3];
-        w.slot = r;
+        w.slot = m[4];
     } else {   // a commit reads no tokens: starts may be absent
         w.first = s.starts ? s.starts[r] : 0;
         w.count = s.starts ? s.starts[r + 1] - w.first : 0;
@@ -222,7 +222,10 @@ __global__ void __launch_bounds__(kRowThreads) pool_delta_kernel(DeltaShape d, R
     const int h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int ratio = d.v_heads / d.k_heads, kh = h / ratio;
     const int j0 = blockIdx.y * kRowColumns + warp * 4;
-    if(w.sequence < 0) {   // a row of no sequence (an unbound round slot): zero outputs, no state read or written
+    const bool scratched = w.kind == kFinal || w.kind == kCheckpoints || w.kind == kRecompute;
+    if(w.sequence < 0 || (scratched && (!p.scratch || w.slot < 0))) {
+        // a row of no sequence (an unbound round slot), or of a kind that writes scratch without any: zero outputs, no
+        // state read or written
         if(lane == 0)
             for(int t = 0; t < w.count; ++t)
 #pragma unroll
@@ -295,45 +298,49 @@ __global__ void __launch_bounds__(kRowThreads) pool_delta_kernel(DeltaShape d, R
     if(w.kind == kFinal) tile_store<R>(scratch + head, S, d.dk, d.dv, lane, j0);
 }
 
-// kReplay and kFlushPending over every layer: block per (value head, 32 value columns, row * layers + layer).
+// kReplay and kFlushPending over every layer: block per (value head, 32 value columns, row), walking the layers.
 template <int R>
 __global__ void __launch_bounds__(kRowThreads) pool_replay_kernel(DeltaShape d, PoolDelta p, RowSource src, int layers,
                                                                   const std::int64_t* accepted, int columns, int mode) {
-    const int r = blockIdx.z / layers, layer = blockIdx.z % layers;
+    const int r = blockIdx.z;
     const Row w = row_of(src, r);
-    if(w.sequence < 0) return;
+    if(w.sequence < 0 || (mode == kReplay && w.slot < 0)) return;
     const int h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int kh = h / (d.v_heads / d.k_heads), j0 = blockIdx.y * kRowColumns + warp * 4;
     const int blocks = d.v_heads * gridDim.y, slot = h * gridDim.y + blockIdx.y;
     const std::int64_t head = std::int64_t(h) * d.dk * d.dv;
-    float* live = p.states + layer * p.state_layer + w.sequence * p.state_sequence + head;
-    float* stash = p.stash + layer * p.stash_layer + w.sequence * p.stash_sequence;
-    std::int32_t* control = p.control + layer * p.control_layer + w.sequence * p.control_sequence;
     __shared__ int s_n, s_parity;
-    if(threadIdx.x == 0) {
-        s_parity = control[blocks + slot] & 1;
-        if(mode == kFlushPending) {
-            s_n = min(max(control[slot], 0), p.capacity);
-        } else {
-            const std::int64_t n = accepted[r];
-            s_n = int(n < 0 ? 0 : n > columns ? columns : n);
+    for(int layer = 0; layer < layers; ++layer) {
+        float* live = p.states + layer * p.state_layer + w.sequence * p.state_sequence + head;
+        float* stash = p.stash + layer * p.stash_layer + w.sequence * p.stash_sequence;
+        std::int32_t* control = p.control + layer * p.control_layer + w.sequence * p.control_sequence;
+        if(layer) __syncthreads();   // the previous layer's readers of s_n and s_parity are done
+        if(threadIdx.x == 0) {
+            s_parity = control[blocks + slot] & 1;
+            if(mode == kFlushPending) {
+                s_n = min(max(control[slot], 0), p.capacity);
+            } else {
+                const std::int64_t n = accepted[r];
+                s_n = int(n < 0 ? 0 : n > columns ? columns : n);
+            }
         }
+        __syncthreads();
+        const int n = s_n, parity = s_parity;
+        if(mode == kFlushPending && threadIdx.x == 0) control[slot] = 0;
+        if(mode == kFlushPending && !n) continue;
+        float S[R][4];
+        const float* from = mode == kReplay ? p.scratch + layer * p.scratch_layer + std::int64_t(w.slot) * p.scratch_slot + head
+                                            : live;
+        tile_load<R>(S, from, d.dk, d.dv, lane, j0);
+        tile_replay<R>(S, d, half_at(d, stash, parity, p.capacity), n, h, kh, lane, j0);
+        tile_store<R>(live, S, d.dk, d.dv, lane, j0);
     }
-    __syncthreads();
-    const int n = s_n;
-    if(mode == kFlushPending && threadIdx.x == 0) control[slot] = 0;
-    if(mode == kFlushPending && !n) return;
-    float S[R][4];
-    const float* from = mode == kReplay ? p.scratch + layer * p.scratch_layer + std::int64_t(w.slot) * p.scratch_slot + head : live;
-    tile_load<R>(S, from, d.dk, d.dv, lane, j0);
-    tile_replay<R>(S, d, half_at(d, stash, s_parity, p.capacity), n, h, kh, lane, j0);
-    tile_store<R>(live, S, d.dk, d.dv, lane, j0);
 }
 
 template <int R>
 cudaError_t replay_launch(const DeltaShape& d, const PoolDelta& p, const RowSource& s, int layers, const std::int64_t* accepted,
                           int columns, int mode, cudaStream_t stream) {
-    const dim3 grid(d.v_heads, (d.dv + kRowColumns - 1) / kRowColumns, s.rows * layers);
+    const dim3 grid(d.v_heads, (d.dv + kRowColumns - 1) / kRowColumns, s.rows);
     pool_replay_kernel<R><<<grid, kRowThreads, 0, stream>>>(d, p, s, layers, accepted, columns, mode);
     return cudaGetLastError();
 }
@@ -379,23 +386,9 @@ __device__ __forceinline__ void pool_conv_shift(float (&win)[W - 1], float xt) {
     win[W - 2] = xt;
 }
 
+// One layer of one row for one channel: the pending inputs shifted in, then the row's inputs.
 template <int W, class T>
-__global__ void __launch_bounds__(kPoolConvThreads) pool_conv_kernel(ConvInputs c, PoolConv p, RowSource src, int layers) {
-    const int r = blockIdx.y / layers, layer = blockIdx.y % layers;
-    const Row w = row_of(src, r);
-    const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x;
-    if(w.sequence < 0) {   // a row of no sequence (an unbound round slot): zero outputs, no window read or written
-        if(ch < c.channels && w.kind != kFlush)
-            for(int t = 0; t < w.count; ++t) static_cast<T*>(c.out)[(w.first + std::int64_t(t)) * c.out_row + ch] = of_float<T>(0.f);
-        return;
-    }
-    std::int32_t* pending = p.pending + layer * p.pending_layer + w.sequence * p.pending_sequence + blockIdx.x;
-    __shared__ int s_n;
-    if(threadIdx.x == 0) s_n = min(max(*pending, 0), p.capacity);
-    __syncthreads();
-    if(threadIdx.x == 0) *pending = 0;
-    if(ch >= c.channels) return;
-    const int n = s_n;
+__device__ __forceinline__ void conv_layer(const ConvInputs& c, const PoolConv& p, const Row& w, int layer, int ch, int n) {
     float* window = p.window + layer * p.window_layer + w.sequence * p.window_sequence + std::int64_t(ch) * (W - 1);
     const float* stash_in = p.stash + layer * p.stash_layer + w.sequence * p.stash_sequence;
     float win[W - 1];
@@ -422,6 +415,31 @@ __global__ void __launch_bounds__(kPoolConvThreads) pool_conv_kernel(ConvInputs 
         float* to = p.scratch + std::int64_t(w.slot) * p.scratch_slot + std::int64_t(ch) * (W - 1);
 #pragma unroll
         for(int i = 0; i < W - 1; ++i) to[i] = win[i];
+    }
+}
+
+template <int W, class T>
+__global__ void __launch_bounds__(kPoolConvThreads) pool_conv_kernel(ConvInputs c, PoolConv p, RowSource src, int layers) {
+    const Row w = row_of(src, blockIdx.y);
+    const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x;
+    if(w.sequence < 0 || (w.kind == kFinal && (!p.scratch || w.slot < 0))) {
+        // a row of no sequence (an unbound round slot), or a FINAL row without scratch: zero outputs, no window read or
+        // written
+        if(ch < c.channels && w.kind != kFlush)
+            for(int t = 0; t < w.count; ++t) static_cast<T*>(c.out)[(w.first + std::int64_t(t)) * c.out_row + ch] = of_float<T>(0.f);
+        return;
+    }
+    // A block walks the layers (a flush of every layer; a forward row has one): each layer's pending count read once.
+    __shared__ int s_n;
+    for(int layer = 0; layer < layers; ++layer) {
+        std::int32_t* pending = p.pending + layer * p.pending_layer + w.sequence * p.pending_sequence + blockIdx.x;
+        if(layer) __syncthreads();   // the previous layer's readers of s_n are done
+        if(threadIdx.x == 0) {
+            s_n = min(max(*pending, 0), p.capacity);
+            *pending = 0;
+        }
+        __syncthreads();
+        if(ch < c.channels) conv_layer<W, T>(c, p, w, layer, ch, s_n);
     }
 }
 
@@ -459,7 +477,7 @@ template <int W, class T>
 cudaError_t conv_launch(const ConvInputs& c, const PoolConv* p, const RowSource* s, int layers, const float* in, float* out,
                         int rows, cudaStream_t stream) {
     const int blocks = (c.channels + kPoolConvThreads - 1) / kPoolConvThreads;
-    if(p) pool_conv_kernel<W, T><<<dim3(blocks, s->rows * layers), kPoolConvThreads, 0, stream>>>(c, *p, *s, layers);
+    if(p) pool_conv_kernel<W, T><<<dim3(blocks, s->rows), kPoolConvThreads, 0, stream>>>(c, *p, *s, layers);
     else conv_segments_kernel<W, T><<<dim3(blocks, (rows + kPoolConvSegment - 1) / kPoolConvSegment), kPoolConvThreads, 0, stream>>>(c, in, out, rows);
     return cudaGetLastError();
 }
@@ -527,7 +545,7 @@ int pool_conv_blocks(int channels) { return channels < 1 ? 0 : (channels + kPool
 
 cudaError_t enqueue_pool_conv(const ConvInputs& c, const PoolConv& p, const RowSource& s, int layers, cudaStream_t stream) {
     if(!valid_source(s, true) || layers < 1 || c.channels < 1 || c.width < 2 || c.width > kPoolMaxConv || !c.weight || !p.window ||
-       !p.stash || !p.pending || p.capacity < 1 || std::int64_t(s.rows) * layers > 65535)
+       !p.stash || !p.pending || p.capacity < 1 || (c.x && c.out == c.x))
         return cudaErrorInvalidValue;
     if(!s.rows) return cudaSuccess;
     return conv_dispatch(c, &p, &s, layers, nullptr, nullptr, 0, stream);
