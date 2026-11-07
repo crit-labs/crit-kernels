@@ -1,0 +1,27 @@
+[general]
+name = "topk-routing"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+edition = 6
+
+[general.hub]
+repo-id = "crit-labs/topk-routing"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.topk_routing]
+language = "cpp-cuda"
+depends = ["torch"]
+cuda-capabilities = ["8.0", "8.6", "8.9", "9.0", "10.0", "10.3", "11.0", "12.0", "12.1"]
+src = [
+  "topk_routing_cuda/binding.cu",
+  "topk_routing_cuda/topk_routing.cu",
+  "topk_routing_cuda/topk_routing.h",
+]
