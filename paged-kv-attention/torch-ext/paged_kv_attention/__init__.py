@@ -42,7 +42,7 @@ import triton
 
 from . import _kernels
 
-__all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "attend", "partitions", "prefill", "write"]
+__all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "attend", "partitions", "prefill", "workspace_floats", "write"]
 
 KINDS = {"bf16": 0, "fp16": 0, "fp8": 1, "fp8:row": 2, "int8": 3}
 PIECE = 64          # positions per piece: the unit of a partition's walk
@@ -98,26 +98,30 @@ def write(keys, values, slots, key_pages, value_pages, kind, key_scales=None, va
     """A step's keys [tokens][kv_heads][dim] and values [tokens][kv_heads][value_dim] (any float dtype) into their
     slots ([tokens] int64; a slot below 0 is skipped) of one layer's pages (any view whose storage is [slots][kv_heads]
     [dim]), encoded for the page kind (multipliers: an "fp8" layer's key and value multipliers, codes = x / multiplier
-    clamped to +-448; the scales of "fp8:row" and "int8" pages are written beside their codes), in one launch."""
+    clamped to +-448; the scales of "fp8:row" and "int8" pages are written beside their codes), in one launch.
+    values and value_pages None: keys only (a cache of keys alone, an indexer's)."""
     k_kind = _check_kind(kind, key_scales)
     T, hkv, d = keys.shape
-    dv = values.shape[-1]
     if T == 0:
         return
     if keys.stride(-1) != 1:
         keys = keys.contiguous()
-    if values.stride(-1) != 1:
+    heads = 2 * hkv
+    if values is None:
+        values, value_pages, value_scales, heads = keys, key_pages, key_scales, hkv
+    elif values.stride(-1) != 1:
         values = values.contiguous()
+    dv = values.shape[-1]
     kp, vp = key_pages, value_pages
     if k_kind in (1, 2):
         kp, vp = kp.view(torch.uint8), vp.view(torch.uint8)
     ks = key_scales if key_scales is not None else _dummy(keys.device)
     vs = value_scales if value_scales is not None else ks
     bd = triton.next_power_of_2(max(d, dv))
-    _kernels._write_kernel[(T, 2 * hkv)](keys, values, slots, kp, vp, ks, vs, keys.stride(0), keys.stride(1),
-                                         values.stride(0), values.stride(1), float(multipliers[0]),
-                                         float(multipliers[1]), HKV=hkv, D=d, DV=dv, BD=bd, KIND=k_kind,
-                                         num_warps=1 if bd <= 128 else 2)
+    _kernels._write_kernel[(T, heads)](keys, values, slots, kp, vp, ks, vs, keys.stride(0), keys.stride(1),
+                                       values.stride(0), values.stride(1), float(multipliers[0]),
+                                       float(multipliers[1]), HKV=hkv, D=d, DV=dv, BD=bd, KIND=k_kind,
+                                       num_warps=1 if bd <= 128 else 2)
 
 
 def _tile(columns, group, dim, rows=None):
@@ -133,9 +137,20 @@ def _tile(columns, group, dim, rows=None):
     return rows, rows // group
 
 
-def _workspace(device, rows, columns, heads, parts, dv):
-    """Partials for rows x columns x heads x parts: outputs, maxima and sums. Grown outside a capture only."""
+def workspace_floats(rows, columns, heads, partitions, value_dim):
+    """FP32 floats of the partials a launch of `rows` rows of `columns` columns needs (attend's workspace)."""
+    return rows * columns * heads * partitions * (value_dim + 2)
+
+
+def _workspace(device, rows, columns, heads, parts, dv, given=None):
+    """Partials for rows x columns x heads x parts: outputs, maxima and sums, in `given` (one FP32 tensor of
+    workspace_floats or more) or in a module workspace that grows outside a capture only."""
     need = rows * columns * heads * parts
+    if given is not None:
+        if given.dtype != torch.float32 or given.numel() < need * (dv + 2):
+            raise ValueError(f"attend's workspace holds {given.numel()} floats; this launch needs {need * (dv + 2)} "
+                             "(workspace_floats)")
+        return given[:need * dv], given[need * dv:need * (dv + 1)], given[need * (dv + 1):need * (dv + 2)]
     found = _workspaces.get(device)
     if found is None or found[1].numel() < need:
         if torch.cuda.is_current_stream_capturing():
@@ -157,7 +172,8 @@ def _workspace(device, rows, columns, heads, parts, dv):
 
 def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, columns, page, *, counts=None,
            key_scales=None, value_scales=None, multipliers=(1.0, 1.0), scale=None, partitions=None, parents=None,
-           blocks=None, block_size=None, out=None, lse=None, tile=None, num_warps=4, num_stages=2):
+           blocks=None, block_size=None, out=None, lse=None, tile=None, workspace=None, piece=PIECE, num_warps=4,
+           num_stages=2):
     """Decode and verify windows over paged KV (see the module's description).
 
     q [tokens][heads][dim] BF16 or FP16 (FP16 for "fp16" pages); key_pages/value_pages one layer's pages, key_scales/
@@ -167,7 +183,9 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     view of them) each token's parent column, -1 for none; blocks [tokens][k] int32 KV block ids and block_size.
     Writes out [tokens][heads][value_dim] (q's dtype) at the rows' tokens, and lse [tokens][heads] FP32 (natural log
     of each row's softmax sum over its scaled scores) when given; returns out. tile: the query tile's rows (default:
-    the launch's columns of query heads, up to 64 or 128); a column's bits do not depend on it."""
+    the launch's columns of query heads, up to 64 or 128); a column's bits do not depend on it. workspace: an FP32
+    tensor of workspace_floats(R, columns, heads, partitions, value_dim) or more for the partials (default: one the
+    module keeps per device, grown outside a capture)."""
     k_kind = _check_kind(kind, key_scales)
     T, hq, d = q.shape
     hkv, dv = key_pages.shape[-2], value_pages.shape[-1]
@@ -187,9 +205,11 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     tree = parents is not None
     par = parents.reshape(-1) if tree else starts
     count_ptr = counts if counts is not None else starts
-    po, pm, pl = _workspace(device, R, columns, hq, parts, dv)
-    common = dict(HQ=hq, HKV=hkv, G=g, D=d, DV=dv, PIECE=PIECE, PAGE=page, KIND=k_kind,
-                  HW_FP8=_hardware_fp8(device), TREE=tree, COUNTS=counts is not None)
+    po, pm, pl = _workspace(device, R, columns, hq, parts, dv, workspace)
+    if max(d, dv) > 4 * min(64, d, dv):
+        raise ValueError("head dims are powers of two of 16 to 256 (keys and values within four 64-wide chunks)")
+    common = dict(HQ=hq, HKV=hkv, G=g, D=d, DV=dv, PIECE=piece, PAGE=page, KIND=k_kind,
+                  HW_FP8=_hardware_fp8(device), TREE=tree, COUNTS=counts is not None, DC=min(64, d, dv))
     if blocks is None:
         bm, cpt = _tile(columns, g, max(d, dv), tile)
         grid = (triton.cdiv(columns, cpt), parts, R * hkv)
@@ -211,11 +231,13 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
                                       tables.stride(0), tables.shape[1], parts, scale, float(multipliers[0]),
                                       float(multipliers[1]), columns, COLS=columns, BLOCK_M=bm, num_warps=num_warps,
                                       num_stages=num_stages, **common)
-        fixed = triton.cdiv(k * int(block_size), PIECE)
+        fixed = triton.cdiv(k * int(block_size), piece)
+    block_p = triton.next_power_of_2(parts)
     _kernels._merge_kernel[(columns, hq, R)](po, pm, pl, out, lse if lse is not None else pm, starts, count_ptr,
                                              firsts, parts, fixed, out.stride(0), out.stride(1), columns, COLS=columns,
-                                             HQ=hq, DV=dv, PIECE=PIECE, COUNTS=counts is not None,
-                                             LSE=lse is not None, num_warps=1 if dv <= 128 else 2)
+                                             HQ=hq, DV=dv, PIECE=piece, COUNTS=counts is not None,
+                                             LSE=lse is not None, BLOCK_P=block_p, CHUNK_P=min(16, block_p),
+                                             num_warps=4)
     return out
 
 

@@ -112,12 +112,59 @@ def _ancestors(par_ptr, start, c, live, COLS: tl.constexpr):
 
 
 @triton.jit
+def _piece_scores(qrow, live, krow, nm, BLOCK_M: tl.constexpr, PIECE: tl.constexpr, D: tl.constexpr,
+                  DC: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr):
+    """The query rows' dot products with a piece's keys, the head dimension in chunks of DC (the chained dots keep a
+    full dot's k-step order, so the bits are those of one dot over D; the chunks keep the tiles out of the spills)."""
+    dc = tl.arange(0, DC)
+    s = tl.zeros([BLOCK_M, PIECE], tl.float32)
+    for ci in tl.static_range(D // DC):
+        qc = tl.load(qrow[:, None] + (ci * DC + dc)[None, :], mask=live[:, None], other=0.0)
+        kc = tl.load(krow[:, None] + (ci * DC + dc)[None, :], mask=nm[:, None], other=0)
+        s = tl.dot(qc, tl.trans(_values(kc, KIND, HW_FP8, qc.dtype)), s)
+    return s
+
+
+@triton.jit
+def _piece_values(acc0, acc1, acc2, acc3, alpha, pv, vrow, nm, DV: tl.constexpr, DC: tl.constexpr,
+                  KIND: tl.constexpr, HW_FP8: tl.constexpr):
+    """The value accumulators (up to four chunks of DC of the value dimension) rescaled by alpha and given a piece's
+    probabilities times its values."""
+    dc = tl.arange(0, DC)
+    v0 = tl.load(vrow[:, None] + dc[None, :], mask=nm[:, None], other=0)
+    acc0 = acc0 * alpha[:, None] + tl.dot(pv, _values(v0, KIND, HW_FP8, pv.dtype))
+    if DV // DC > 1:
+        v1 = tl.load(vrow[:, None] + (DC + dc)[None, :], mask=nm[:, None], other=0)
+        acc1 = acc1 * alpha[:, None] + tl.dot(pv, _values(v1, KIND, HW_FP8, pv.dtype))
+    if DV // DC > 2:
+        v2 = tl.load(vrow[:, None] + (2 * DC + dc)[None, :], mask=nm[:, None], other=0)
+        acc2 = acc2 * alpha[:, None] + tl.dot(pv, _values(v2, KIND, HW_FP8, pv.dtype))
+    if DV // DC > 3:
+        v3 = tl.load(vrow[:, None] + (3 * DC + dc)[None, :], mask=nm[:, None], other=0)
+        acc3 = acc3 * alpha[:, None] + tl.dot(pv, _values(v3, KIND, HW_FP8, pv.dtype))
+    return acc0, acc1, acc2, acc3
+
+
+@triton.jit
+def _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV: tl.constexpr, DC: tl.constexpr):
+    dc = tl.arange(0, DC)
+    row = po_ptr + idx[:, None] * DV
+    tl.store(row + dc[None, :], acc0, mask=live[:, None])
+    if DV // DC > 1:
+        tl.store(row + (DC + dc)[None, :], acc1, mask=live[:, None])
+    if DV // DC > 2:
+        tl.store(row + (2 * DC + dc)[None, :], acc2, mask=live[:, None])
+    if DV // DC > 3:
+        tl.store(row + (3 * DC + dc)[None, :], acc3, mask=live[:, None])
+
+
+@triton.jit
 def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, par_ptr,
                    po_ptr, pm_ptr, pl_ptr, stride_qt, stride_qh, tab_stride, tab_width, n_parts, sm_scale, k_mult,
                    v_mult, count_all, COLS: tl.constexpr, CPT: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr,
                    G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, PIECE: tl.constexpr,
                    PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr, TREE: tl.constexpr,
-                   COUNTS: tl.constexpr):
+                   COUNTS: tl.constexpr, DC: tl.constexpr):
     """Program (column tile, partition b, row x KV head): the tile's query rows (its columns x the KV head's query
     heads) over pieces b, b + n_parts, ... of the row's keys, up to its last column's position; writes each row's
     unnormalized output, running maximum and sum into the partials."""
@@ -141,24 +188,23 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
         c = (c0 + j // G).to(tl.int64)
         g = j % G
         live = (j < CPT * G) & (c < count)
-        d = tl.arange(0, D)
-        dv = tl.arange(0, DV)
-        q = tl.load(q_ptr + (start + c)[:, None] * stride_qt + (kvh * G + g)[:, None] * stride_qh + d[None, :],
-                    mask=live[:, None], other=0.0)
+        qrow = q_ptr + (start + c) * stride_qt + (kvh * G + g) * stride_qh
         lim = first + c
         if TREE:
             anc = _ancestors(par_ptr, start, c, live, COLS)
         m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
         l_i = tl.zeros([BLOCK_M], tl.float32)
-        acc = tl.zeros([BLOCK_M, DV], tl.float32)
-        ones = tl.full([PIECE, 16], 1.0, q.dtype)
+        acc0 = tl.zeros([BLOCK_M, DC], tl.float32)
+        acc1 = tl.zeros([BLOCK_M, DC], tl.float32)
+        acc2 = tl.zeros([BLOCK_M, DC], tl.float32)
+        acc3 = tl.zeros([BLOCK_M, DC], tl.float32)
+        ones = tl.full([PIECE, 16], 1.0, q_ptr.dtype.element_ty)
         for i in range(b, n_pieces, n_parts):
             n = i * PIECE + tl.arange(0, PIECE)
             nm = n < n_keys
             pg = tl.load(tab_ptr + trow * tab_stride + tl.minimum(n // PAGE, tab_width - 1), mask=nm, other=0)
             slot = pg.to(tl.int64) * PAGE + n % PAGE
-            kc = tl.load(k_ptr + (slot * HKV + kvh)[:, None] * D + d[None, :], mask=nm[:, None], other=0)
-            s = tl.dot(q, tl.trans(_values(kc, KIND, HW_FP8, q.dtype)))
+            s = _piece_scores(qrow, live, k_ptr + (slot * HKV + kvh) * D, nm, BLOCK_M, PIECE, D, DC, KIND, HW_FP8)
             if KIND >= 2:
                 ksc = tl.load(ks_ptr + slot * HKV + kvh, mask=nm, other=0.0)
                 s = s * (ksc * sm_scale)[None, :]
@@ -176,18 +222,18 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
             m_sub = tl.where(m_new == float("-inf"), 0.0, m_new)
             p = tl.exp(s - m_sub[:, None])
             alpha = tl.exp(m_i - m_sub)
-            vc = tl.load(v_ptr + (slot * HKV + kvh)[:, None] * DV + dv[None, :], mask=nm[:, None], other=0)
             if KIND >= 2:
                 vsc = tl.load(vs_ptr + slot * HKV + kvh, mask=nm, other=0.0)
-                pv = (p * vsc[None, :]).to(q.dtype)
+                pv = (p * vsc[None, :]).to(ones.dtype)
             else:
-                pv = (p * v_mult).to(q.dtype)
-            acc = acc * alpha[:, None] + tl.dot(pv, _values(vc, KIND, HW_FP8, q.dtype))
+                pv = (p * v_mult).to(ones.dtype)
+            acc0, acc1, acc2, acc3 = _piece_values(acc0, acc1, acc2, acc3, alpha, pv, v_ptr + (slot * HKV + kvh) * DV,
+                                                   nm, DV, DC, KIND, HW_FP8)
             # The row sums on the tensor cores too: a fixed summation order, whatever the tile's layout.
-            l_i = l_i * alpha + tl.max(tl.dot(p.to(q.dtype), ones), axis=1)
+            l_i = l_i * alpha + tl.max(tl.dot(p.to(ones.dtype), ones), axis=1)
             m_i = m_new
         idx = ((r * COLS + c) * HQ + kvh * G + g) * n_parts + b
-        tl.store(po_ptr + idx[:, None] * DV + dv[None, :], acc, mask=live[:, None])
+        _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV, DC)
         tl.store(pm_ptr + idx, m_i, mask=live)
         tl.store(pl_ptr + idx, l_i, mask=live)
 
@@ -198,7 +244,7 @@ def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
                    tab_width, n_parts, sm_scale, k_mult, v_mult, count_all, COLS: tl.constexpr, HQ: tl.constexpr,
                    HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr,
                    PIECE: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
-                   TREE: tl.constexpr, COUNTS: tl.constexpr):
+                   TREE: tl.constexpr, COUNTS: tl.constexpr, DC: tl.constexpr):
     """Program (partition b, KV head, row x column): one token's query heads of the KV head over the positions of its
     listed KV blocks (blocks[token][0 .. n_blocks - 1], -1 for none), read as one run of n_blocks * block_size
     positions in list order, its tiles b, b + n_parts, ...; positions past the token's own (or outside its tree) are
@@ -220,17 +266,17 @@ def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
         tok = start + c
         g = tl.arange(0, BLOCK_M)
         live = g < G
-        d = tl.arange(0, D)
-        dv = tl.arange(0, DV)
-        q = tl.load(q_ptr + tok * stride_qt + (kvh * G + g)[:, None] * stride_qh + d[None, :], mask=live[:, None],
-                    other=0.0)
+        qrow = q_ptr + tok * stride_qt + (kvh * G + g) * stride_qh
         if TREE:
             # Every row is the same column: its mask (identical on every row) taken as a scalar.
             anc = tl.max(_ancestors(par_ptr, start, tl.zeros([BLOCK_M], tl.int64) + c, g >= 0, COLS), axis=0)
         m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
         l_i = tl.zeros([BLOCK_M], tl.float32)
-        acc = tl.zeros([BLOCK_M, DV], tl.float32)
-        ones = tl.full([PIECE, 16], 1.0, q.dtype)
+        acc0 = tl.zeros([BLOCK_M, DC], tl.float32)
+        acc1 = tl.zeros([BLOCK_M, DC], tl.float32)
+        acc2 = tl.zeros([BLOCK_M, DC], tl.float32)
+        acc3 = tl.zeros([BLOCK_M, DC], tl.float32)
+        ones = tl.full([PIECE, 16], 1.0, q_ptr.dtype.element_ty)
         for i in range(b, n_tiles, n_parts):
             u = i * PIECE + tl.arange(0, PIECE)
             e = u // block_size
@@ -245,8 +291,7 @@ def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
             nm = (blk >= 0) & (n < first + count) & seen
             pg = tl.load(tab_ptr + trow * tab_stride + tl.minimum(n // PAGE, tab_width - 1), mask=nm, other=0)
             slot = pg.to(tl.int64) * PAGE + n % PAGE
-            kc = tl.load(k_ptr + (slot * HKV + kvh)[:, None] * D + d[None, :], mask=nm[:, None], other=0)
-            s = tl.dot(q, tl.trans(_values(kc, KIND, HW_FP8, q.dtype)))
+            s = _piece_scores(qrow, live, k_ptr + (slot * HKV + kvh) * D, nm, BLOCK_M, PIECE, D, DC, KIND, HW_FP8)
             if KIND >= 2:
                 ksc = tl.load(ks_ptr + slot * HKV + kvh, mask=nm, other=0.0)
                 s = s * (ksc * sm_scale)[None, :]
@@ -257,17 +302,17 @@ def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
             m_sub = tl.where(m_new == float("-inf"), 0.0, m_new)
             p = tl.exp(s - m_sub[:, None])
             alpha = tl.exp(m_i - m_sub)
-            vc = tl.load(v_ptr + (slot * HKV + kvh)[:, None] * DV + dv[None, :], mask=nm[:, None], other=0)
             if KIND >= 2:
                 vsc = tl.load(vs_ptr + slot * HKV + kvh, mask=nm, other=0.0)
-                pv = (p * vsc[None, :]).to(q.dtype)
+                pv = (p * vsc[None, :]).to(ones.dtype)
             else:
-                pv = (p * v_mult).to(q.dtype)
-            acc = acc * alpha[:, None] + tl.dot(pv, _values(vc, KIND, HW_FP8, q.dtype))
-            l_i = l_i * alpha + tl.max(tl.dot(p.to(q.dtype), ones), axis=1)
+                pv = (p * v_mult).to(ones.dtype)
+            acc0, acc1, acc2, acc3 = _piece_values(acc0, acc1, acc2, acc3, alpha, pv, v_ptr + (slot * HKV + kvh) * DV,
+                                                   nm, DV, DC, KIND, HW_FP8)
+            l_i = l_i * alpha + tl.max(tl.dot(p.to(ones.dtype), ones), axis=1)
             m_i = m_new
         idx = ((r * COLS + c) * HQ + kvh * G + g) * n_parts + b
-        tl.store(po_ptr + idx[:, None] * DV + dv[None, :], acc, mask=live[:, None])
+        _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV, DC)
         tl.store(pm_ptr + idx, m_i, mask=live)
         tl.store(pl_ptr + idx, l_i, mask=live)
 
@@ -275,9 +320,12 @@ def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
 @triton.jit
 def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr, first_ptr, n_parts, n_fixed,
                   stride_ot, stride_oh, count_all, COLS: tl.constexpr, HQ: tl.constexpr, DV: tl.constexpr,
-                  PIECE: tl.constexpr, COUNTS: tl.constexpr, LSE: tl.constexpr):
-    """Program (column, query head, row): the partials of the partitions that hold the column's keys, merged in
-    partition order by their maxima and sums (log-sum-exp weights), into the output row (and its log-sum-exp)."""
+                  PIECE: tl.constexpr, COUNTS: tl.constexpr, LSE: tl.constexpr, BLOCK_P: tl.constexpr,
+                  CHUNK_P: tl.constexpr):
+    """Program (column, query head, row): the partials of the partitions that hold the column's keys, merged by their
+    maxima and sums (log-sum-exp weights) into the output row (and its log-sum-exp). The sums run over tiles of
+    CHUNK_P partitions in partition order, a tile's in one fixed tree: the same order for every launch over a pool
+    (BLOCK_P and CHUNK_P follow the partition count), so a column's bits are its own."""
     c = tl.program_id(0)
     h = tl.program_id(1)
     r = tl.program_id(2)
@@ -294,16 +342,20 @@ def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr
             nb = tl.minimum(n_parts, tl.cdiv(first + c + 1, PIECE)).to(tl.int32)
         base = ((r * COLS + c) * HQ + h).to(tl.int64) * n_parts
         dv = tl.arange(0, DV)
-        top = tl.load(pm_ptr + base)
-        for b in range(1, nb):
-            top = tl.maximum(top, tl.load(pm_ptr + base + b))
-        den = 0.0
+        b = tl.arange(0, BLOCK_P)
+        ms = tl.load(pm_ptr + base + b, mask=b < nb, other=float("-inf"))
+        top = tl.max(ms, axis=0)
+        sub = tl.where(top == float("-inf"), 0.0, top)
+        ws = tl.where(ms == float("-inf"), 0.0, tl.exp(ms - sub))
+        den = tl.sum(ws * tl.load(pl_ptr + base + b, mask=b < nb, other=0.0), axis=0)
         acc = tl.zeros([DV], tl.float32)
-        for b in range(0, nb):
-            mb = tl.load(pm_ptr + base + b)
-            w = tl.where(mb == float("-inf"), 0.0, tl.exp(mb - top))
-            den = den + w * tl.load(pl_ptr + base + b)
-            acc = acc + w * tl.load(po_ptr + (base + b) * DV + dv)
+        j = tl.arange(0, CHUNK_P)
+        for b0 in range(0, nb, CHUNK_P):
+            jb = b0 + j
+            mj = tl.load(pm_ptr + base + jb, mask=jb < nb, other=float("-inf"))
+            wj = tl.where(mj == float("-inf"), 0.0, tl.exp(mj - sub))
+            oj = tl.load(po_ptr + (base + jb)[:, None] * DV + dv[None, :], mask=(jb < nb)[:, None], other=0.0)
+            acc = acc + tl.sum(wj[:, None] * oj, axis=0)
         o = tl.where(den > 0, acc / den, 0.0)
         tl.store(out_ptr + (start + c) * stride_ot + h * stride_oh + dv, o.to(out_ptr.dtype.element_ty))
         if LSE:

@@ -1,7 +1,6 @@
 """Against torch's encoding rules and a float64 reference: page writes, decode and verify windows (row and column
 invariance, trees, block lists, log-sum-exp), CUDA graph replay at other lengths, and prompt chunks."""
 import math
-import time
 
 import pytest
 import torch
@@ -272,12 +271,13 @@ def test_work_follows_the_rows_length_not_the_capacity():
         firsts.fill_(first)
         for _ in range(3):
             graph.replay()
-        torch.cuda.synchronize()
-        start = time.perf_counter()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
         for _ in range(20):
             graph.replay()
-        torch.cuda.synchronize()
-        return (time.perf_counter() - start) / 20
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / 20
     short, long = timed(4_000), timed(199_000)
     assert long > 8 * short, (short, long)
 
