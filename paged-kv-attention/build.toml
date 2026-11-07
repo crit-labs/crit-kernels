@@ -1,0 +1,13 @@
+[general]
+name = "paged-kv-attention"
+version = 1
+edition = 6
+license = "Apache-2.0"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "crit-labs/paged-kv-attention"
+
+[torch-noarch]
+
+[kernel]

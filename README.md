@@ -11,6 +11,7 @@ techniques name them as `hub:crit-labs/<folder>` in their `kernels.json`.
 | [fp8-block-rows](fp8-block-rows/CARD.md) | `crit-labs/fp8-block-rows` | quantized-projections: matched FP8 projections (E4M3 weights and activations, block or row scales) |
 | [grouped-experts](grouped-experts/CARD.md) | `crit-labs/grouped-experts` | expert-streamed-prefill: grouped mixture-of-experts projections for prompt chunks |
 | [int-block-experts](int-block-experts/CARD.md) | `crit-labs/int-block-experts` | host-expert-arithmetic: 4-bit integer block expert projections, bit-identical to crit's CPU rows |
+| [paged-kv-attention](paged-kv-attention/CARD.md) | `crit-labs/paged-kv-attention` | attention-state: page writes, split-KV decode and verify windows (trees, block lists) and prompt chunks over BF16, FP8 and INT8 pages (Triton) |
 | [recurrent-scans](recurrent-scans/CARD.md) | `crit-labs/recurrent-scans` | recurrent-state-recovery: kernels for the recurrent layers of hybrid models (gated delta and more) |
 
 Each card lists the formats, GPUs, shapes, numerics and measured speed a kernel was checked for. Read it, and run the
