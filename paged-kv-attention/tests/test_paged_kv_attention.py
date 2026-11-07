@@ -186,23 +186,27 @@ def test_a_count_past_the_columns_reads_as_the_columns():
     assert torch.equal(got, want)    # row 0's partials stay its own (no row writes past its columns)
 
 
-def _lowering(arch, group, d, kind, columns):
+def _lowering(arch, group, d, kind, columns, fused=False):
     """The MMA instructions Triton gives the window launch tile_for() picks for `columns` columns on `arch` (compiled
     offline, no GPU of that kind needed): from the TTGIR, wgmma (warp_group_dot), tcgen05 (tc_gen5_mma) or mma.sync
     (nvidia_mma v2)."""
     import triton
     from triton.backends.compiler import GPUTarget
-    rows, warps, stages = pk.tile_for(columns, group, (arch // 10, arch % 10))
+    rows, warps, stages = pk.tile_for(columns, group, (arch // 10, arch % 10), fused)
     kernel = pk._kernels._window_kernel
     store = {0: "*bf16", 1: "*u8", 2: "*u8", 3: "*i8"}[kind]
     signature = {"q_ptr": "*bf16", "k_ptr": store, "v_ptr": store, "ks_ptr": "*fp32", "vs_ptr": "*fp32",
                  "tab_ptr": "*i32", "trow_ptr": "*i32", "start_ptr": "*i32", "count_ptr": "*i32", "first_ptr": "*i64",
                  "par_ptr": "*i64", "off_ptr": "*i32", "po_ptr": "*fp32", "pm_ptr": "*fp32", "pl_ptr": "*fp32",
-                 "stride_qt": "i32", "stride_qh": "i32", "tab_stride": "i32", "tab_width": "i32", "n_parts": "i32",
-                 "sm_scale": "fp32", "k_mult": "fp32", "v_mult": "fp32", "count_all": "i32"}
+                 "out_ptr": "*bf16", "lse_ptr": "*fp32", "fk_ptr": "*bf16", "fv_ptr": "*bf16", "fshift_ptr": "*i64",
+                 "ffirst_ptr": "*i64", "stride_qt": "i32", "stride_qh": "i32", "stride_ot": "i32", "stride_oh": "i32",
+                 "stride_fk": "i32", "stride_fv": "i32", "stride_fr": "i32", "tab_stride": "i32", "tab_width": "i32",
+                 "n_parts": "i32", "sm_scale": "fp32", "k_mult": "fp32", "v_mult": "fp32", "count_all": "i32"}
     constants = {"COLS": 8, "CPT": rows // group, "HQ": group * 2, "HKV": 2, "G": group, "D": d, "DV": d,
                  "BLOCK_M": rows, "PIECE": pk.piece_size(d, d, ["bf16", "fp8", "fp8:row", "int8"][kind]), "PAGE": 16,
-                 "KIND": kind, "HW_FP8": arch >= 89, "TREE": False, "COUNTS": True, "OFFSETS": True, "DC": min(64, d)}
+                 "KIND": kind, "HW_FP8": arch >= 89, "TREE": False, "COUNTS": True, "OFFSETS": True, "DC": min(64, d),
+                 "FUSED": fused, "LSE": fused, "FRESH": fused and kind >= 1,
+                 "DVP": d // pk.FUSED_VSPLIT if fused and d > 128 else d}
     names = kernel.arg_names
     full = {n: signature.get(n, "constexpr") for n in names}
     attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if full[n].startswith("*")}
@@ -224,12 +228,21 @@ def test_every_window_tile_multiplies_with_mma_sync_on_every_gpu(arch, group, d,
     assert _lowering(arch, group, d, kind, columns) == {"mma.sync"}
 
 
+@pytest.mark.parametrize("arch", [80, 90, 100, 110, 120])
+@pytest.mark.parametrize("group,d,kind", [(6, 256, 2), (6, 256, 3), (7, 128, 3), (12, 256, 0), (6, 256, 1)])
+def test_a_fused_launch_multiplies_with_mma_sync_on_every_gpu(arch, group, d, kind):
+    # A fused launch's tile (up to 32 rows in four warps, fresh rows included) is mma.sync on every GPU too.
+    assert _lowering(arch, group, d, kind, 64, fused=True) == {"mma.sync"}
+
+
 def test_a_wide_window_takes_a_64_row_tile_only_where_it_stays_mma_sync():
     assert pk.tile_for(5, 12, (12, 0)) == (64, 4, 4)
     assert pk.tile_for(5, 12, (9, 0)) == (32, 2, 3)
     assert pk.tile_for(5, 12, (10, 0)) == (32, 2, 3)
     assert pk.tile_for(1, 6, (12, 0)) == (16, 2, 3)
     assert pk.tile_for(5, 6, (12, 0)) == (32, 2, 3)
+    assert pk.tile_for(64, 6, (12, 0), fused=True) == (64, 4, 3)     # a fused launch: two output sets, four warps
+    assert pk.tile_for(64, 6, (9, 0), fused=True) == (32, 4, 3)
 
 
 @pytest.mark.kernels_ci
@@ -253,6 +266,79 @@ def test_every_tile_gives_a_column_the_one_column_decodes_bits(kind, hq, hkv, d)
     tree = cache.attend(q[:8], [0], [0], [690], 8, parents=parents)
     alone = cache.attend(q[:8], [0], [0], [690], 8, parents=parents, tile=16, num_warps=2, num_stages=3)
     assert torch.equal(tree, alone)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("kind", ["int8", "fp8:row", "fp8", "bf16"])
+@pytest.mark.parametrize("hq,hkv,d", [(24, 4, 256), (56, 8, 128)])
+def test_a_fused_launch_gives_a_column_the_split_launchs_bits(kind, hq, hkv, d):
+    # Prompt rows as window rows of 64 columns, fused (each program folding its partitions as the merge does): every
+    # column has the bits of the same column decoded alone through the split launch and merge, its log-sum-exp too,
+    # at lengths of one piece, of more pieces than partitions and between; a tree window too.
+    for length in (40, 700, 5000):
+        cache = Cache(kind, hkv, d, d, 64, [length], seed=1)
+        T = min(130, length)
+        pos0 = length - T
+        q = _q(T, hq, d, 2)
+        starts = list(range(0, T, 64))
+        counts = torch.tensor([min(64, T - s) for s in starts], dtype=torch.int32, device=dev)
+        lse, one_lse = torch.empty(T, hq, device=dev), torch.empty(T, hq, device=dev)
+        fused = cache.attend(q, [0] * len(starts), starts, [pos0 + s for s in starts], 64, counts=counts, fused=True,
+                             lse=lse)
+        alone = cache.attend(q, [0] * T, list(range(T)), [pos0 + i for i in range(T)], 1, lse=one_lse)
+        assert torch.equal(fused, alone), (kind, length)
+        assert torch.equal(lse, one_lse), (kind, length)
+    parents = torch.tensor([-1, 0, 0, 1, 1, 2, 5, 3], dtype=torch.int64, device=dev)
+    tree = cache.attend(q[:8], [0], [0], [pos0], 8, parents=parents)
+    assert torch.equal(cache.attend(q[:8], [0], [0], [pos0], 8, parents=parents, fused=True), tree)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("kind", ["fp8:row", "int8", "fp8"])
+def test_a_fused_chunk_reads_its_own_keys_and_values_fresh(kind):
+    # The chunk's positions from a first one on (shift and first on the device: one CUDA graph) from fresh rows, the
+    # earlier ones from the pages: float64 attention over [the pages' prefix, the fresh rows]; with the first fresh
+    # position past the chunk the pages' bits exactly.
+    cache = Cache(kind, 2, 128, 128, 16, [700], multipliers=(0.05, 0.04))
+    g = torch.Generator().manual_seed(21)
+    T = 100
+    q = _q(T, 8, 128, 22).to(torch.bfloat16)
+    fk = torch.randn(T, 2, 128, generator=g).to(dev).to(torch.bfloat16)
+    fv = torch.randn(T, 2, 128, generator=g).to(dev).to(torch.bfloat16)
+    frontier = torch.zeros(1, dtype=torch.int64, device=dev)
+    first = torch.zeros(1, dtype=torch.int64, device=dev)
+    starts = torch.tensor([0, 64], dtype=torch.int32, device=dev)
+    offsets = torch.tensor([0, 64], dtype=torch.int64, device=dev)
+    counts = torch.tensor([64, T - 64], dtype=torch.int32, device=dev)
+    rows = torch.zeros(2, dtype=torch.int32, device=dev)
+    out, lse = torch.empty_like(q), torch.empty(T, 8, device=dev)
+    firsts = torch.empty(2, dtype=torch.int64, device=dev)
+
+    def launch():
+        torch.add(offsets, frontier, out=firsts)
+        pk.attend(q, cache.k, cache.v, kind, cache.tables, rows, starts, firsts, 64, 16, counts=counts,
+                  key_scales=cache.ks, value_scales=cache.vs, multipliers=cache.multipliers, out=out, lse=lse,
+                  fused=True, fresh=(fk, fv, frontier, first))
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    qd = q.double()
+    for at in (0, 200, 600):
+        frontier.fill_(at)
+        for split in (0, 37, 100):
+            first.fill_(at + split)
+            graph.replay()
+            keys, values = cache.rows(0, at + split)
+            keys, values = torch.cat([keys, fk[split:].double()]), torch.cat([values, fv[split:].double()])
+            for t in (0, 41, 99):
+                seen = torch.arange(at + T, device=dev) <= at + t
+                want, want_lse = reference(qd[t], keys, values, seen, 128 ** -0.5)
+                torch.testing.assert_close(out[t].double(), want, atol=8e-3, rtol=2e-2, msg=(at, split, t))
+                torch.testing.assert_close(lse[t].double(), want_lse, atol=1e-3, rtol=1e-4, msg=(at, split, t))
+            if split == T:
+                paged = cache.attend(q, [0, 0], [0, 64], [at, at + 64], 64, counts=counts)
+                assert torch.equal(out, paged), at
 
 
 @pytest.mark.kernels_ci

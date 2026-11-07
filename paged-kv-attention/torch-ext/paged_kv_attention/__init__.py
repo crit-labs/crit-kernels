@@ -150,9 +150,11 @@ NARROW_ROWS = 32                 # rows of the tiles every GPU multiplies with m
 WARPS, STAGES = 2, 3             # a tile of up to 32 rows
 WIDE_ROWS, WIDE_WARPS, WIDE_STAGES = 64, 4, 4   # a 64-row tile, where four warps over it stay mma.sync
 WARPGROUP_MMA = (9, 10, 11)      # major capabilities whose tensor cores take four warps over 64 rows as warpgroup MMA
+FUSED_WARPS = 4                  # a fused launch's tile in four warps (two output sets),
+FUSED_VSPLIT = 2                 # its value columns over two programs past 128 (no spills at 64 rows of 256-wide heads)
 
 
-def tile_for(columns, group, capability):
+def tile_for(columns, group, capability, fused=False):
     """(rows, warps, stages) of a window launch's query tile, for `columns` columns over KV heads serving `group` query
     heads each on a GPU of `capability` (major, minor): the smallest power of two of 16 rows or more holding the
     columns' query rows, up to 32, in two warps; past 32 rows a 64-row tile in four warps (each piece's keys and values
@@ -161,10 +163,16 @@ def tile_for(columns, group, capability):
     heads a group, one column a tile of its power of two rows in two warps. So on each GPU every tile is multiplied with
     mma.sync, one instruction shape and summation order whatever the tile, and a column's bits are the same alone and
     in any window (the tests compile each choice for sm_80, sm_90, sm_100, sm_110 and sm_120 and check). Measured on
-    one sm_120 GPU (an RTX 5090): 64 rows in four warps read windows of more than 32 query rows fastest there."""
+    one sm_120 GPU (an RTX 5090): 64 rows in four warps read windows of more than 32 query rows fastest there. A fused
+    launch (its programs hold a partition's output and the folded one, each over half the value columns) takes the
+    same rows in four warps."""
     if group > NARROW_ROWS:
-        return triton.next_power_of_2(group), WARPS, STAGES
+        return triton.next_power_of_2(group), FUSED_WARPS if fused else WARPS, STAGES
     rows = columns * group
+    if fused:
+        if rows <= NARROW_ROWS or capability[0] in WARPGROUP_MMA:
+            return max(16, triton.next_power_of_2(min(rows, NARROW_ROWS))), FUSED_WARPS, STAGES
+        return WIDE_ROWS, FUSED_WARPS, STAGES
     if rows <= NARROW_ROWS or capability[0] in WARPGROUP_MMA:
         return max(16, triton.next_power_of_2(min(rows, NARROW_ROWS))), WARPS, STAGES
     return WIDE_ROWS, WIDE_WARPS, WIDE_STAGES
@@ -207,7 +215,7 @@ def _workspace(device, tokens, heads, parts, dv, given=None):
 def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, columns, page, *, counts=None,
            offsets=None, tokens=None, key_scales=None, value_scales=None, multipliers=(1.0, 1.0), scale=None,
            partitions=None, parents=None, blocks=None, block_size=None, out=None, lse=None, workspace=None, piece=None,
-           tile=None, num_warps=None, num_stages=None, maxnreg=None):
+           fused=False, fresh=None, vsplit=None, tile=None, num_warps=None, num_stages=None, maxnreg=None):
     """Decode and verify windows over paged KV (see the module's description).
 
     q [tokens][heads][dim] BF16 or FP16 (FP16 for "fp16" pages); key_pages/value_pages one layer's pages, key_scales/
@@ -222,8 +230,16 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     rows' tokens, and lse [tokens][heads] FP32 (natural log of each row's softmax sum over its scaled scores) when
     given; returns out. workspace: an FP32 tensor of workspace_floats(partial rows, heads, partitions, value_dim) or
     more for the partials (default: one the module keeps per device, grown outside a capture). piece: positions per
-    piece (default piece_size). tile, num_warps, num_stages, maxnreg: another launch configuration than tile_for()'s
-    (a measurement's), whose columns keep their bits only where the GPU multiplies it with mma.sync too."""
+    piece (default piece_size). fused: each program reads every partition of its columns in turn and folds
+    them as the merge does, writing the output itself: the same bits as the split launch, no workspace (a prompt
+    chunk's rows, whose partials would not fit; no block lists). fresh: (keys [N][kv_heads][dim], values
+    [N][kv_heads][value_dim] in q's dtype, shift, first): each row's positions from first on read from those rows
+    instead of the pages (row = position - shift; a prompt chunk's own keys and values as the projections gave them),
+    shift and first int64 tensors of one element a row, or of one element for every row (a captured chunk's, on the
+    device). vsplit: a fused launch's programs per tile, each holding a part of the value columns (default
+    FUSED_VSPLIT past 128 value columns, else 1: fewer registers, each recomputing the scores; the same bits). tile,
+    num_warps, num_stages, maxnreg: another launch configuration than tile_for()'s (a measurement's),
+    whose columns keep their bits only where the GPU multiplies it with mma.sync too."""
     k_kind = _check_kind(kind, key_scales)
     T, hq, d = q.shape
     hkv, dv = key_pages.shape[-2], value_pages.shape[-1]
@@ -241,7 +257,12 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     device = q.device
     parts = int(partitions or globals()["partitions"](device, hkv, kind))
     scale = float(scale if scale is not None else d ** -0.5)
-    po, pm, pl = _workspace(device, partial_rows, hq, parts, dv, workspace)
+    if fused and blocks is not None:
+        raise ValueError("a fused launch reads windows without block lists")
+    if fused:
+        po = pm = pl = _dummy(device)
+    else:
+        po, pm, pl = _workspace(device, partial_rows, hq, parts, dv, workspace)
     out = torch.empty(T, hq, dv, dtype=q.dtype, device=device) if out is None else out
     kp, vp = _codes(key_pages, kind, device), _codes(value_pages, kind, device)
     ks = key_scales if key_scales is not None else _dummy(device)
@@ -252,7 +273,7 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     off_ptr = offsets if offsets is not None else starts
     launch = {"maxnreg": int(maxnreg)} if maxnreg else {}
     piece = int(piece or piece_size(d, dv, kind))
-    bm, warps, stages = tile_for(columns, g, _capability(device)[0])
+    bm, warps, stages = tile_for(columns, g, _capability(device)[0], fused)
     if tile:
         bm = max(16, triton.next_power_of_2(max(int(tile), g)))
     warps, stages = num_warps or warps, num_stages or stages
@@ -260,12 +281,35 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
                   HW_FP8=_hardware_fp8(device), TREE=tree, COUNTS=counts is not None, OFFSETS=offsets is not None,
                   DC=min(64, d, dv))
     if blocks is None:
+        if fresh is not None:
+            fk, fv, fshift, ffirst = fresh
+            if fk.shape[1:] != (hkv, d) or fv.shape[1:] != (hkv, dv) or fk.stride(-1) != 1 or fv.stride(-1) != 1 or \
+                    fk.stride(1) != d or fv.stride(1) != dv or fshift.numel() != ffirst.numel() or \
+                    fshift.numel() not in (1, R):
+                raise ValueError(f"fresh rows are [N][{hkv}][dim] each, head rows contiguous, with one shift and first "
+                                 "a row or one for every row")
+            fstride = 0 if fshift.numel() == 1 else 1
+        else:
+            fk = fv = q
+            fshift = ffirst = firsts
+            fstride = 0
         cpt = bm // g
-        grid = (triton.cdiv(columns, cpt), parts, R * hkv)
+        dc = min(64, d, dv)
+        split = 1
+        if fused:
+            split = int(vsplit or (FUSED_VSPLIT if dv > 128 else 1))
+            while split > 1 and (dv // split) % dc:
+                split //= 2
+        grid = (triton.cdiv(columns, cpt), split if fused else parts, R * hkv)
         _kernels._window_kernel[grid](q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, off_ptr, po, pm, pl,
-                     q.stride(0), q.stride(1), tables.stride(0), tables.shape[1], parts, scale, float(multipliers[0]),
-                     float(multipliers[1]), columns, COLS=columns, CPT=cpt, BLOCK_M=bm, num_warps=warps,
-                     num_stages=stages, **common, **launch)
+                     out, lse if lse is not None else ks, fk, fv, fshift, ffirst, q.stride(0), q.stride(1),
+                     out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), fstride, tables.stride(0),
+                     tables.shape[1], parts, scale, float(multipliers[0]), float(multipliers[1]), columns,
+                     COLS=columns, CPT=cpt, BLOCK_M=bm, num_warps=warps, num_stages=stages, FUSED=bool(fused),
+                     LSE=bool(fused) and lse is not None, FRESH=fresh is not None, DVP=dv // split, **common,
+                     **launch)
+        if fused:
+            return out
         fixed = 0
     else:
         if not block_size or block_size < 1:

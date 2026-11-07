@@ -14,16 +14,24 @@ KV pool and its attention plugins):
 - **`attend`**: decode tokens and speculative-verify windows (up to 64 columns a row, causal inside the window) over the
   pages through per-row page tables, split over KV partitions: piece `i` (16 to 128 positions, set by the head width
   and the page kind) goes to partition `i mod P`, each partition walks only up to its row's last position (read on
-  the device), and the partials merge in partition order by their log-sum-exps. The work follows each row's length,
-  not the cache's capacity, and one CUDA graph replays at every length. Tree masks (`parents`: a draft tree's columns
-  see their ancestors and themselves), block-sparse lists (`blocks`, `block_size`: a token sees only its listed KV
-  blocks), log-sum-exp outputs (`lse`), and partials packed by the rows' tokens (`offsets`), so a launch's workspace
-  follows its tokens.
+  the device), and the partials fold in partition order (a running maximum, the sum and output rescaled to it). The
+  work follows each row's length, not the cache's capacity, and one CUDA graph replays at every length. Tree masks
+  (`parents`: a draft tree's columns see their ancestors and themselves), block-sparse lists (`blocks`, `block_size`:
+  a token sees only its listed KV blocks), log-sum-exp outputs (`lse`), and partials packed by the rows' tokens
+  (`offsets`), so a launch's workspace follows its tokens. `fused`: each program reads every partition of its columns
+  in turn and folds them as the merge does, writing the output itself: the same bits as the split launch, no
+  workspace, so a prompt chunk read as windows of 64 columns has the bits of its tokens decoded one by one (its value
+  columns split over `vsplit` programs, each computing the scores: fewer registers, the same bits). `fresh`: each
+  row's positions from a first one on read from 16-bit rows given beside the pages (a prompt chunk's own keys and
+  values as the projections gave them), the earlier ones from the pages (whose bits stay as without them).
 - **`prefill`**: a causal prompt chunk of one sequence over its pages (any page kind; `int8_qk` multiplies INT8 queries
   with INT8 keys on integer tensor cores); its position an int or a device tensor (one CUDA graph for every position);
   with `fresh` the chunk's own keys and values as the projections gave them (16-bit), the earlier positions from the
   pages at their kind's precision (over FP8 and INT8 pages the chunk then does not see its own quantization); a first
-  fresh position (an int or a device tensor) reads the chunk's positions before it from the pages too.
+  fresh position (an int or a device tensor) reads the chunk's positions before it from the pages too. Another
+  reduction than `attend`'s (FP32 row sums in one pass over 32- or 64-position blocks): its outputs and a decode's
+  differ by the readers' rounding (up to 1.6e-2 in BF16 outputs over a few dozen positions, 2.4e-4 over 12K); a chunk
+  that must have its tokens' decode bits reads through `attend(..., fused=True)` as windows of 64 columns.
 
 Numerics: codes convert exactly to BF16 (FP16 for FP16 pages); scores and the softmax in FP32 with BF16 probabilities
 on the tensor cores. A window launch's query tile (`tile_for`) holds its columns of a KV head's query heads: 16 or 32

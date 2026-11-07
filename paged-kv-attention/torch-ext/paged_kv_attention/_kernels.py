@@ -168,15 +168,146 @@ def _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV: tl.constexpr,
 
 
 @triton.jit
+def _piece_rows(rows, frows, onp, isf, cols, KIND: tl.constexpr, HW_FP8: tl.constexpr, OUT: tl.constexpr):
+    """Columns `cols` of a piece's key or value rows in the dot product's dtype: from the pages where onp (codes or
+    16-bit values, exactly), from the fresh 16-bit rows where isf."""
+    pg = tl.load(rows[:, None] + cols[None, :], mask=onp[:, None], other=0)
+    fr = tl.load(frows[:, None] + cols[None, :], mask=isf[:, None], other=0.0)
+    return tl.where(isf[:, None], fr.to(OUT), _values(pg, KIND, HW_FP8, OUT))
+
+
+@triton.jit
+def _fresh_scores(qrow, live, krow, frow, onp, isf, BLOCK_M: tl.constexpr, PIECE: tl.constexpr, D: tl.constexpr,
+                  DC: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr):
+    """_piece_scores with some of the piece's keys from fresh rows: a column's dot products are its own key's, so a
+    paged position's score has the bits it has without fresh rows."""
+    dc = tl.arange(0, DC)
+    s = tl.zeros([BLOCK_M, PIECE], tl.float32)
+    for ci in tl.static_range(D // DC):
+        qc = tl.load(qrow[:, None] + (ci * DC + dc)[None, :], mask=live[:, None], other=0.0)
+        s = tl.dot(qc, tl.trans(_piece_rows(krow, frow, onp, isf, ci * DC + dc, KIND, HW_FP8, qc.dtype)), s)
+    return s
+
+
+@triton.jit
+def _fresh_values(acc0, acc1, acc2, acc3, alpha, pv, vrow, frow, onp, isf, DV: tl.constexpr, DC: tl.constexpr,
+                  KIND: tl.constexpr, HW_FP8: tl.constexpr):
+    """_piece_values with some of the piece's values from fresh rows."""
+    dc = tl.arange(0, DC)
+    acc0 = acc0 * alpha[:, None] + tl.dot(pv, _piece_rows(vrow, frow, onp, isf, dc, KIND, HW_FP8, pv.dtype))
+    if DV // DC > 1:
+        acc1 = acc1 * alpha[:, None] + tl.dot(pv, _piece_rows(vrow, frow, onp, isf, DC + dc, KIND, HW_FP8, pv.dtype))
+    if DV // DC > 2:
+        acc2 = acc2 * alpha[:, None] + tl.dot(pv, _piece_rows(vrow, frow, onp, isf, 2 * DC + dc, KIND, HW_FP8,
+                                                              pv.dtype))
+    if DV // DC > 3:
+        acc3 = acc3 * alpha[:, None] + tl.dot(pv, _piece_rows(vrow, frow, onp, isf, 3 * DC + dc, KIND, HW_FP8,
+                                                              pv.dtype))
+    return acc0, acc1, acc2, acc3
+
+
+@triton.jit
+def _partition(b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count, k_ptr, v_ptr, ks_ptr, vs_ptr,
+               tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
+               stride_fv, fshift, ffirst, ones, vofs, BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr,
+               HKV: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, DVP: tl.constexpr, DC: tl.constexpr,
+               KIND: tl.constexpr, HW_FP8: tl.constexpr, TREE: tl.constexpr, FRESH: tl.constexpr):
+    """Partition b of a tile's query rows: pieces b, b + n_parts, ... of the row's keys (up to n_keys) in one online
+    softmax -> (running maximum, sum, unnormalized output of the DVP value columns from vofs, in up to four DC-wide
+    chunks). With FRESH the positions from ffirst on read their keys and values from the fresh rows (row = position -
+    fshift; 16-bit, no page scales)."""
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc0 = tl.zeros([BLOCK_M, DC], tl.float32)
+    acc1 = tl.zeros([BLOCK_M, DC], tl.float32)
+    acc2 = tl.zeros([BLOCK_M, DC], tl.float32)
+    acc3 = tl.zeros([BLOCK_M, DC], tl.float32)
+    for i in range(b, n_pieces, n_parts):
+        n = i * PIECE + tl.arange(0, PIECE)
+        nm = n < n_keys
+        pg = tl.load(tab_ptr + trow * tab_stride + tl.minimum(n // PAGE, tab_width - 1), mask=nm, other=0)
+        slot = pg.to(tl.int64) * PAGE + n % PAGE
+        if FRESH:
+            isf = nm & (n >= ffirst)
+            onp = nm & (n < ffirst)
+            t = (n - fshift).to(tl.int64)
+            s = _fresh_scores(qrow, live, k_ptr + (slot * HKV + kvh) * D, fk_ptr + t * stride_fk + kvh * D, onp, isf,
+                              BLOCK_M, PIECE, D, DC, KIND, HW_FP8)
+        else:
+            s = _piece_scores(qrow, live, k_ptr + (slot * HKV + kvh) * D, nm, BLOCK_M, PIECE, D, DC, KIND, HW_FP8)
+        if KIND >= 2:
+            ksc = tl.load(ks_ptr + slot * HKV + kvh, mask=nm, other=0.0)
+            if FRESH:
+                ksc = tl.where(isf, 1.0, ksc)
+            s = s * (ksc * sm_scale)[None, :]
+        elif FRESH:
+            s = s * (tl.where(isf, 1.0, k_mult) * sm_scale)[None, :]
+        else:
+            s = s * (k_mult * sm_scale)
+        if TREE:
+            w = n - first
+            inw = (w >= 0) & (w < count)
+            bit = (anc[:, None] >> tl.where(inw, w, 0)[None, :]) & 1
+            vis = nm[None, :] & ((n < first)[None, :] | (inw[None, :] & (bit != 0)))
+        else:
+            vis = nm[None, :] & (n[None, :] <= lim[:, None])
+        s = tl.where(vis, s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        m_sub = tl.where(m_new == float("-inf"), 0.0, m_new)
+        p = tl.exp(s - m_sub[:, None])
+        alpha = tl.exp(m_i - m_sub)
+        if KIND >= 2:
+            vsc = tl.load(vs_ptr + slot * HKV + kvh, mask=nm, other=0.0)
+            if FRESH:
+                vsc = tl.where(isf, 1.0, vsc)
+            pv = (p * vsc[None, :]).to(ones.dtype)
+        elif FRESH:
+            pv = (p * tl.where(isf, 1.0, v_mult)[None, :]).to(ones.dtype)
+        else:
+            pv = (p * v_mult).to(ones.dtype)
+        if FRESH:
+            acc0, acc1, acc2, acc3 = _fresh_values(acc0, acc1, acc2, acc3, alpha, pv,
+                                                   v_ptr + (slot * HKV + kvh) * DV + vofs,
+                                                   fv_ptr + t * stride_fv + kvh * DV + vofs, onp, isf, DVP, DC, KIND,
+                                                   HW_FP8)
+        else:
+            acc0, acc1, acc2, acc3 = _piece_values(acc0, acc1, acc2, acc3, alpha, pv,
+                                                   v_ptr + (slot * HKV + kvh) * DV + vofs, nm, DVP, DC, KIND, HW_FP8)
+        # The row sums on the tensor cores too: a fixed summation order, whatever the tile's layout.
+        l_i = l_i * alpha + tl.max(tl.dot(p.to(ones.dtype), ones), axis=1)
+        m_i = m_new
+    return m_i, l_i, acc0, acc1, acc2, acc3
+
+
+@triton.jit
+def _fold(m_run, l_run, m, l):
+    """One partition's (maximum m, sum l) into the running (m_run, l_run), in partition order: -> (maximum, sum, the
+    running output's factor, the partition output's factor). The merge and the fused window kernel both fold so: one
+    rule, the same bits."""
+    m_new = tl.maximum(m_run, m)
+    m_sub = tl.where(m_new == float("-inf"), 0.0, m_new)
+    keep = tl.exp(m_run - m_sub)
+    take = tl.exp(m - m_sub)
+    return m_new, tl.fma(l_run, keep, l * take), keep, take
+
+
+@triton.jit
 def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, par_ptr,
-                   off_ptr, po_ptr, pm_ptr, pl_ptr, stride_qt, stride_qh, tab_stride, tab_width, n_parts, sm_scale,
-                   k_mult, v_mult, count_all, COLS: tl.constexpr, CPT: tl.constexpr, HQ: tl.constexpr,
-                   HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr,
-                   PIECE: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
-                   TREE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr, DC: tl.constexpr):
+                   off_ptr, po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, fk_ptr, fv_ptr, fshift_ptr, ffirst_ptr,
+                   stride_qt, stride_qh, stride_ot, stride_oh, stride_fk, stride_fv, stride_fr, tab_stride, tab_width,
+                   n_parts, sm_scale, k_mult, v_mult, count_all, COLS: tl.constexpr, CPT: tl.constexpr,
+                   HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr,
+                   BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr,
+                   HW_FP8: tl.constexpr, TREE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr,
+                   DC: tl.constexpr, FUSED: tl.constexpr, LSE: tl.constexpr, FRESH: tl.constexpr,
+                   DVP: tl.constexpr):
     """Program (column tile, partition b, row x KV head): the tile's query rows (its columns x the KV head's query
     heads) over pieces b, b + n_parts, ... of the row's keys, up to its last column's position; writes each row's
-    unnormalized output, running maximum and sum into the partials."""
+    unnormalized output, running maximum and sum into the partials. FUSED (grid (tiles, DV / DVP, rows x KV heads)):
+    the program reads every partition in turn and folds them as the merge does (_fold), writing the output (and the
+    log-sum-exps) itself: the same bits, no partials; program b holds value columns b * DVP .. b * DVP + DVP - 1 (its
+    scores computed by each such program, the same in each). FRESH: per row, the positions from ffirst on from the
+    fresh rows (fshift, ffirst: int64 per row, stride_fr apart, 0 for one for every row)."""
     mt = tl.program_id(0)
     b = tl.program_id(1)
     rk = tl.program_id(2)
@@ -190,7 +321,13 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
     first = tl.load(first_ptr + r).to(tl.int64)
     n_keys = first + tl.minimum(count, c0 + CPT)
     n_pieces = tl.cdiv(n_keys, PIECE).to(tl.int32)
-    if (c0 < count) & (b < n_pieces):
+    if FUSED:
+        part0 = 0
+        vofs = b * DVP
+    else:
+        part0 = b
+        vofs = 0
+    if (c0 < count) & (part0 < n_pieces):
         start = tl.load(start_ptr + r).to(tl.int64)
         trow = tl.load(trow_ptr + r).to(tl.int64)
         j = tl.arange(0, BLOCK_M)
@@ -199,52 +336,68 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
         live = (j < CPT * G) & (c < count)
         qrow = q_ptr + (start + c) * stride_qt + (kvh * G + g) * stride_qh
         lim = first + c
+        anc = c
         if TREE:
             anc = _ancestors(par_ptr, start, c, live, COLS)
-        m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
-        l_i = tl.zeros([BLOCK_M], tl.float32)
-        acc0 = tl.zeros([BLOCK_M, DC], tl.float32)
-        acc1 = tl.zeros([BLOCK_M, DC], tl.float32)
-        acc2 = tl.zeros([BLOCK_M, DC], tl.float32)
-        acc3 = tl.zeros([BLOCK_M, DC], tl.float32)
+        fshift = first
+        ffirst = first
+        if FRESH:
+            fshift = tl.load(fshift_ptr + r * stride_fr)
+            ffirst = tl.load(ffirst_ptr + r * stride_fr)
         ones = tl.full([PIECE, 16], 1.0, q_ptr.dtype.element_ty)
-        for i in range(b, n_pieces, n_parts):
-            n = i * PIECE + tl.arange(0, PIECE)
-            nm = n < n_keys
-            pg = tl.load(tab_ptr + trow * tab_stride + tl.minimum(n // PAGE, tab_width - 1), mask=nm, other=0)
-            slot = pg.to(tl.int64) * PAGE + n % PAGE
-            s = _piece_scores(qrow, live, k_ptr + (slot * HKV + kvh) * D, nm, BLOCK_M, PIECE, D, DC, KIND, HW_FP8)
-            if KIND >= 2:
-                ksc = tl.load(ks_ptr + slot * HKV + kvh, mask=nm, other=0.0)
-                s = s * (ksc * sm_scale)[None, :]
-            else:
-                s = s * (k_mult * sm_scale)
-            if TREE:
-                w = n - first
-                inw = (w >= 0) & (w < count)
-                bit = (anc[:, None] >> tl.where(inw, w, 0)[None, :]) & 1
-                vis = nm[None, :] & ((n < first)[None, :] | (inw[None, :] & (bit != 0)))
-            else:
-                vis = nm[None, :] & (n[None, :] <= lim[:, None])
-            s = tl.where(vis, s, float("-inf"))
-            m_new = tl.maximum(m_i, tl.max(s, axis=1))
-            m_sub = tl.where(m_new == float("-inf"), 0.0, m_new)
-            p = tl.exp(s - m_sub[:, None])
-            alpha = tl.exp(m_i - m_sub)
-            if KIND >= 2:
-                vsc = tl.load(vs_ptr + slot * HKV + kvh, mask=nm, other=0.0)
-                pv = (p * vsc[None, :]).to(ones.dtype)
-            else:
-                pv = (p * v_mult).to(ones.dtype)
-            acc0, acc1, acc2, acc3 = _piece_values(acc0, acc1, acc2, acc3, alpha, pv, v_ptr + (slot * HKV + kvh) * DV,
-                                                   nm, DV, DC, KIND, HW_FP8)
-            # The row sums on the tensor cores too: a fixed summation order, whatever the tile's layout.
-            l_i = l_i * alpha + tl.max(tl.dot(p.to(ones.dtype), ones), axis=1)
-            m_i = m_new
-        idx = ((_partial_row(off_ptr, r, COLS, OFFSETS) + c) * HQ + kvh * G + g) * n_parts + b
-        _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV, DC)
-        tl.store(pm_ptr + idx, m_i, mask=live)
-        tl.store(pl_ptr + idx, l_i, mask=live)
+        if FUSED:
+            m_run = tl.full([BLOCK_M], float("-inf"), tl.float32)
+            l_run = tl.zeros([BLOCK_M], tl.float32)
+            out0 = tl.zeros([BLOCK_M, DC], tl.float32)
+            out1 = tl.zeros([BLOCK_M, DC], tl.float32)
+            out2 = tl.zeros([BLOCK_M, DC], tl.float32)
+            out3 = tl.zeros([BLOCK_M, DC], tl.float32)
+            # A column folds the partitions the merge folds for it: those that hold its positions.
+            held = tl.minimum(n_parts, tl.cdiv(lim + 1, PIECE))
+            for part in range(0, tl.minimum(n_parts, n_pieces)):
+                m_i, l_i, acc0, acc1, acc2, acc3 = _partition(
+                    part, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count, k_ptr, v_ptr, ks_ptr, vs_ptr,
+                    tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
+                    stride_fv, fshift, ffirst, ones, vofs, BLOCK_M, PIECE, PAGE, HKV, D, DV, DVP, DC, KIND, HW_FP8,
+                    TREE, FRESH)
+                m_new, l_new, keep, take = _fold(m_run, l_run, m_i, l_i)
+                use = part < held
+                m_run = tl.where(use, m_new, m_run)
+                l_run = tl.where(use, l_new, l_run)
+                out0 = tl.where(use[:, None], tl.fma(out0, keep[:, None], acc0 * take[:, None]), out0)
+                if DVP // DC > 1:
+                    out1 = tl.where(use[:, None], tl.fma(out1, keep[:, None], acc1 * take[:, None]), out1)
+                if DVP // DC > 2:
+                    out2 = tl.where(use[:, None], tl.fma(out2, keep[:, None], acc2 * take[:, None]), out2)
+                if DVP // DC > 3:
+                    out3 = tl.where(use[:, None], tl.fma(out3, keep[:, None], acc3 * take[:, None]), out3)
+            dc = tl.arange(0, DC)
+            row = out_ptr + (start + c)[:, None] * stride_ot + (kvh * G + g)[:, None] * stride_oh + vofs
+            ok = l_run > 0
+            dtype = out_ptr.dtype.element_ty
+            tl.store(row + dc[None, :], tl.where(ok[:, None], out0 / l_run[:, None], 0.0).to(dtype), mask=live[:, None])
+            if DVP // DC > 1:
+                tl.store(row + (DC + dc)[None, :], tl.where(ok[:, None], out1 / l_run[:, None], 0.0).to(dtype),
+                         mask=live[:, None])
+            if DVP // DC > 2:
+                tl.store(row + (2 * DC + dc)[None, :], tl.where(ok[:, None], out2 / l_run[:, None], 0.0).to(dtype),
+                         mask=live[:, None])
+            if DVP // DC > 3:
+                tl.store(row + (3 * DC + dc)[None, :], tl.where(ok[:, None], out3 / l_run[:, None], 0.0).to(dtype),
+                         mask=live[:, None])
+            if LSE:
+                tl.store(lse_ptr + (start + c) * HQ + kvh * G + g, tl.where(ok, m_run + tl.log(l_run), float("-inf")),
+                         mask=live & (b == 0))
+        else:
+            m_i, l_i, acc0, acc1, acc2, acc3 = _partition(
+                b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count, k_ptr, v_ptr, ks_ptr, vs_ptr,
+                tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
+                stride_fv, fshift, ffirst, ones, vofs, BLOCK_M, PIECE, PAGE, HKV, D, DV, DVP, DC, KIND, HW_FP8,
+                TREE, FRESH)
+            idx = ((_partial_row(off_ptr, r, COLS, OFFSETS) + c) * HQ + kvh * G + g) * n_parts + b
+            _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV, DC)
+            tl.store(pm_ptr + idx, m_i, mask=live)
+            tl.store(pl_ptr + idx, l_i, mask=live)
 
 
 @triton.jit
@@ -332,10 +485,10 @@ def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr
                   stride_ot, stride_oh, count_all, COLS: tl.constexpr, HQ: tl.constexpr, DV: tl.constexpr,
                   PIECE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr, LSE: tl.constexpr,
                   BLOCK_P: tl.constexpr, CHUNK_P: tl.constexpr):
-    """Program (column, query head, row): the partials of the partitions that hold the column's keys, merged by their
-    maxima and sums (log-sum-exp weights) into the output row (and its log-sum-exp). The sums run over tiles of
-    CHUNK_P partitions in partition order, a tile's in one fixed tree: the same order for every launch over a pool
-    (BLOCK_P and CHUNK_P follow the partition count), so a column's bits are its own."""
+    """Program (column, query head, row): the partials of the partitions that hold the column's keys folded in
+    partition order (_fold: a running maximum, the sum and output rescaled to it), into the output row (and its
+    log-sum-exp). The loop takes CHUNK_P partitions a turn (their loads issued together), each folded in order, so a
+    column's bits are the fused window kernel's too."""
     c = tl.program_id(0)
     h = tl.program_id(1)
     r = tl.program_id(2)
@@ -352,24 +505,25 @@ def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr
             nb = tl.minimum(n_parts, tl.cdiv(first + c + 1, PIECE)).to(tl.int32)
         base = ((_partial_row(off_ptr, r, COLS, OFFSETS) + c) * HQ + h) * n_parts
         dv = tl.arange(0, DV)
-        b = tl.arange(0, BLOCK_P)
-        ms = tl.load(pm_ptr + base + b, mask=b < nb, other=float("-inf"))
-        top = tl.max(ms, axis=0)
-        sub = tl.where(top == float("-inf"), 0.0, top)
-        ws = tl.where(ms == float("-inf"), 0.0, tl.exp(ms - sub))
-        den = tl.sum(ws * tl.load(pl_ptr + base + b, mask=b < nb, other=0.0), axis=0)
+        m_run = tl.max(tl.full([CHUNK_P], float("-inf"), tl.float32), axis=0)
+        l_run = tl.sum(tl.zeros([CHUNK_P], tl.float32), axis=0)
         acc = tl.zeros([DV], tl.float32)
-        j = tl.arange(0, CHUNK_P)
         for b0 in range(0, nb, CHUNK_P):
-            jb = b0 + j
-            mj = tl.load(pm_ptr + base + jb, mask=jb < nb, other=float("-inf"))
-            wj = tl.where(mj == float("-inf"), 0.0, tl.exp(mj - sub))
-            oj = tl.load(po_ptr + (base + jb)[:, None] * DV + dv[None, :], mask=(jb < nb)[:, None], other=0.0)
-            acc = acc + tl.sum(wj[:, None] * oj, axis=0)
-        o = tl.where(den > 0, acc / den, 0.0)
+            for k in tl.static_range(CHUNK_P):
+                use = b0 + k < nb
+                at = base + b0 + k
+                m = tl.load(pm_ptr + at, mask=use, other=float("-inf"))
+                l = tl.load(pl_ptr + at, mask=use, other=0.0)
+                o = tl.load(po_ptr + at * DV + dv, mask=(dv < DV) & use, other=0.0)
+                m_new, l_new, keep, take = _fold(m_run, l_run, m, l)
+                m_run = tl.where(use, m_new, m_run)
+                l_run = tl.where(use, l_new, l_run)
+                acc = tl.where(use, tl.fma(acc, keep, o * take), acc)
+        ok = l_run > 0
+        o = tl.where(ok, acc / l_run, 0.0)
         tl.store(out_ptr + (start + c) * stride_ot + h * stride_oh + dv, o.to(out_ptr.dtype.element_ty))
         if LSE:
-            tl.store(lse_ptr + (start + c) * HQ + h, tl.where(den > 0, top + tl.log(den), float("-inf")))
+            tl.store(lse_ptr + (start + c) * HQ + h, tl.where(ok, m_run + tl.log(l_run), float("-inf")))
 
 
 # -- prompt chunks ----------------------------------------------------------------------------------------------------
