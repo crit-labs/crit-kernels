@@ -443,3 +443,90 @@ def test_a_final_row_into_its_own_live_state_continues_it():
     assert torch.equal(out, torch.cat(steps))
     assert torch.equal(whole.states[0, 1], serial.states[0, 1])
     assert torch.equal(whole.states[0, 0], serial.states[0, 0]) and torch.equal(whole.states[0, 2], serial.states[0, 2])
+
+
+def dilated_reference(x, weight, bias, window, dilation, silu=True):
+    """FP64 outputs [T][C] of a causal depthwise convolution at `dilation` from `window` [C][(width - 1) * dilation]
+    (oldest first), and the window after the rows."""
+    padded = torch.cat([window.T.double(), x.double()])
+    w = weight.shape[1]
+    out = torch.stack([sum(padded[t + i * dilation] * weight[:, i].double() for i in range(w)) + bias.double()
+                       for t in range(x.shape[0])])
+    return torch.nn.functional.silu(out) if silu else out, padded[-(w - 1) * dilation:].T
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("shape", [(10240, 4, 3), (300, 2, 4), (300, 3, 2), (300, 4, 1)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_dilated_convolution_follows_the_fp64_one_on_every_path(shape, dtype):
+    """(channels, taps, dilation): Flash-Next's PLE convolution (4 x 2,560 channels, 4 taps at dilation 3) and others.
+    Decode and verify rows from the window (the window kept until the commit), a flush of a pending count, a long row
+    through the segments kernel and through a FINAL row (the same bits), and a padded prompt chunk (the bits of a flush
+    then the segments kernel over its real rows), each against an FP64 dilated convolution."""
+    C, width, dilation = shape
+    span, cap = (width - 1) * dilation, 4
+    tol = dict(rtol=1e-2, atol=1e-2) if dtype != torch.float32 else dict(rtol=1e-5, atol=1e-5)
+    g = torch.Generator(device="cpu").manual_seed(C + width * 10 + dilation)
+    x = torch.randn(90, C, generator=g).to(dev).to(dtype)
+    weight, bias = torch.randn(C, width, generator=g).to(dev), torch.randn(C, generator=g).to(dev)
+    window = torch.randn(1, 3, C, span, generator=g).to(dev)
+    start = window.clone()
+    stash = torch.zeros(1, 3, cap, C, device=dev)
+    pending = torch.zeros(1, 3, rs.pool_conv_blocks(C), dtype=torch.int32, device=dev)
+    assert rs.pool_conv_supported(width, dilation)
+    # A verify row of 3 inputs (sequence 2) beside a decode row (sequence 0): outputs from the windows, which stay.
+    out = torch.zeros(4, C, dtype=dtype, device=dev)
+    meta = torch.tensor([[0, 3, 2, rs.STASH, -1], [3, 1, 0, rs.STASH, -1]], dtype=torch.int32, device=dev)
+    rs.pool_conv(out, window, stash, pending, None, x[:4], weight, bias, meta=meta, rows=2, capacity=cap)
+    for first, count, seq in ((0, 3, 2), (3, 1, 0)):
+        ref, _ = dilated_reference(x[first:first + count].float(), weight, bias, start[0, seq], dilation)
+        torch.testing.assert_close(out[first:first + count].double(), ref.to(dtype).double(), **tol)
+    assert torch.equal(window, start)
+    # Two of the three accepted, then flushed: the window after those two inputs, exact.
+    pending[0, 2] = 2
+    flush = torch.tensor([[0, 0, 2, rs.FLUSH, -1]], dtype=torch.int32, device=dev)
+    rs.pool_conv(out[:0], window, stash, pending, None, x[:0], weight, bias, meta=flush, rows=1, capacity=cap)
+    _, expected = dilated_reference(x[:2].float(), weight, bias, start[0, 2], dilation)
+    torch.testing.assert_close(window[0, 2].double(), expected, rtol=0, atol=0)
+    # A long row: the segments kernel and a FINAL row give the same bits, and the FP64 values.
+    long = x[4:74]
+    seg_out, seg_window = torch.empty_like(long), torch.empty(C, span, device=dev)
+    rs.conv_segments(seg_out, window[0, 1].clone(), seg_window, long, weight, bias)
+    scratch = torch.zeros(1, C, span, device=dev)
+    row_out = torch.empty_like(long)
+    final = torch.tensor([[0, 70, 1, rs.FINAL, 0]], dtype=torch.int32, device=dev)
+    rs.pool_conv(row_out, window, stash, pending, scratch, long, weight, bias, meta=final, rows=1, capacity=cap)
+    assert torch.equal(seg_out, row_out) and torch.equal(seg_window, scratch[0])
+    ref, ref_window = dilated_reference(long.float(), weight, bias, window[0, 1], dilation)
+    torch.testing.assert_close(seg_out.double(), ref.to(dtype).double(), **tol)
+    torch.testing.assert_close(seg_window.double(), ref_window, rtol=0, atol=0)
+    # Rows shorter than the window: its older inputs carry over.
+    short_window = torch.empty(C, span, device=dev)
+    rs.conv_segments(torch.empty_like(x[:1]), window[0, 1].clone(), short_window, x[:1], weight, bias)
+    _, expected = dilated_reference(x[:1].float(), weight, bias, window[0, 1], dilation)
+    torch.testing.assert_close(short_window.double(), expected, rtol=0, atol=0)
+    # A padded prompt chunk of 23 real rows in 64, a pending count of 1 first: a flush then the segments kernel's bits.
+    stash[0, 0, 0] = x[80].float()
+    pending[0, 0] = 1
+    flushed, flushed_pending = window.clone(), pending.clone()
+    rs.pool_conv(out[:0], flushed, stash, flushed_pending, None, x[:0], weight, bias,
+                 meta=torch.tensor([[0, 0, 0, rs.FLUSH, -1]], dtype=torch.int32, device=dev), rows=1, capacity=cap)
+    chunk = x[10:74]
+    expected, after = torch.zeros_like(chunk), torch.empty(C, span, device=dev)
+    rs.conv_segments(expected[:23], flushed[0, 0].clone(), after, chunk[:23], weight, bias)
+    found = torch.full_like(chunk, float("nan"))
+    rs.pool_conv_prompt(found, window, stash, pending, chunk, weight, bias,
+                        meta=torch.tensor([0, 23, 0, rs.FINAL, 0], dtype=torch.int32, device=dev), capacity=cap)
+    assert torch.equal(found, expected) and torch.equal(window[0, 0], after)
+    assert int(pending[0, 0].abs().sum()) == 0
+
+
+@pytest.mark.kernels_ci
+def test_a_convolution_the_kernels_do_not_build_is_refused():
+    assert not rs.pool_conv_supported(5, 2) and not rs.pool_conv_supported(4, 5) and rs.pool_conv_supported(8, 1)
+    C = 16
+    x, weight = torch.randn(4, C, device=dev), torch.randn(C, 5, device=dev)
+    with pytest.raises(RuntimeError, match="dilation 2 is none the kernels run"):
+        rs.conv_segments(torch.empty_like(x), torch.zeros(C, 8, device=dev), torch.zeros(C, 8, device=dev), x, weight)
+    with pytest.raises(RuntimeError, match="holds \(width - 1\) \* dilation"):
+        rs.conv_segments(torch.empty_like(x), torch.zeros(C, 6, device=dev), torch.zeros(C, 6, device=dev), x, weight)

@@ -12,7 +12,7 @@ from ._ops import ops
 __all__ = ["causal_conv1d", "gated_delta_prefill", "gated_delta_scan", "ssd_prefill", "ssd_scan",
            "STASH", "CHECKPOINTS", "RECOMPUTE", "FINAL", "FLUSH", "REPLAY", "FLUSH_PENDING",
            "pool_blocks", "pool_half_floats", "pool_conv_blocks", "pool_delta", "pool_delta_replay", "pool_conv",
-           "conv_segments", "pool_conv_prompt"]
+           "conv_segments", "pool_conv_prompt", "pool_conv_supported"]
 
 
 def causal_conv1d(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor, bias: Optional[torch.Tensor] = None,
@@ -118,10 +118,21 @@ def pool_delta_replay(states, stash, control, scratch, accepted, meta=None, slot
                           mode)
 
 
+def pool_conv_supported(width: int, dilation: int = 1) -> bool:
+    """Whether the pool convolutions run `width` taps at `dilation`: 2 .. 8 taps undilated, 2 .. 4 taps at dilation
+    2 .. 4. A window holds the last (width - 1) * dilation inputs of each channel; the kernels read the dilation from
+    its width."""
+    if dilation == 1:
+        return 2 <= width <= 8
+    return 2 <= width <= 4 and 2 <= dilation <= 4
+
+
 def pool_conv(out, window, stash, pending, scratch, x, weight, bias=None, meta=None, starts=None, slots=None, table=None,
               rows=0, kind=STASH, layer=0, layers=1, capacity=1, silu=True):
     """The causal depthwise convolution of rows over their sequences' windows (window[layer][sequence], after the
-    pending count): x and out [T][channels] (x's dtype; out not x), weight [channels][width] FP32. STASH rows keep
+    pending count): x and out [T][channels] (x's dtype; out not x), weight [channels][width] FP32; window
+    [layers][sequences][channels][(width - 1) * dilation] (its last dimension sets the dilation, pool_conv_supported):
+    y[t] = act(bias + sum_i weight[i] x[t - (width - 1 - i) * dilation]). STASH rows keep
     their inputs for the deferred commit, FINAL rows write the window after their last input to scratch [slots][...],
     FLUSH rows (over `layers` layers from `layer`) apply the pending count only. Capture-safe."""
     ops.pool_conv(out, window, stash, pending, scratch, x, weight, bias, meta, starts, slots, table, rows, kind, layer,
@@ -130,8 +141,8 @@ def pool_conv(out, window, stash, pending, scratch, x, weight, bias=None, meta=N
 
 
 def conv_segments(out, window_in, window_out, x, weight, bias=None, silu=True):
-    """One long row out of place from window_in ([channels][width - 1]), the window after its last input to
-    window_out: a thread per channel and 32 rows, the bits of pool_conv's."""
+    """One long row out of place from window_in ([channels][(width - 1) * dilation]: its width sets the dilation),
+    the window after its last input to window_out: a thread per channel and 32 rows, the bits of pool_conv's."""
     ops.conv_segments(out, window_in, window_out, x, weight, bias, silu)
     return out
 

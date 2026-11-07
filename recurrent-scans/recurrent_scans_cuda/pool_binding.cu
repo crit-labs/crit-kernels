@@ -225,6 +225,15 @@ rk::ConvInputs conv_inputs(torch::Tensor& out, const torch::Tensor& x, const tor
 }
 }  // namespace
 
+// The dilation a window of `span` inputs per channel gives a convolution of c.width taps: span = (width - 1) * dilation.
+void set_dilation(rk::ConvInputs& c, int64_t span) {
+    TORCH_CHECK(c.width >= 2 && span >= c.width - 1 && span % (c.width - 1) == 0,
+                "a window holds (width - 1) * dilation inputs per channel, not ", span, " for ", c.width, " taps");
+    c.dilation = static_cast<int>(span / (c.width - 1));
+    TORCH_CHECK(rk::pool_conv_supported(c.width, c.dilation), "a convolution of ", c.width, " taps at dilation ",
+                c.dilation, " is none the kernels run (2 .. 8 taps undilated, 2 .. 4 taps at dilation 2 .. 4)");
+}
+
 void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, torch::Tensor& pending,
                const std::optional<torch::Tensor>& scratch, const torch::Tensor& x, const torch::Tensor& weight,
                const std::optional<torch::Tensor>& bias, const std::optional<torch::Tensor>& meta,
@@ -236,7 +245,8 @@ void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, 
     check_contiguous(window, "window", torch::kFloat32, 4);
     check_contiguous(stash, "stash", torch::kFloat32, 4);
     check_contiguous(pending, "pending", torch::kInt32, 3);
-    TORCH_CHECK(window.size(2) == c.channels && window.size(3) == c.width - 1, "window must be [layers][sequences][channels][width - 1]");
+    TORCH_CHECK(window.size(2) == c.channels, "window must be [layers][sequences][channels][(width - 1) * dilation]");
+    set_dilation(c, window.size(3));
     TORCH_CHECK(stash.size(0) == window.size(0) && stash.size(2) == capacity && stash.size(3) == c.channels,
                 "stash must be [layers][sequences][capacity][channels]");
     TORCH_CHECK(pending.size(0) == window.size(0) && pending.size(2) == rk::pool_conv_blocks(c.channels),
@@ -256,7 +266,7 @@ void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, 
     if(scratch) {   // a final window per slot
         TORCH_CHECK(scratch->is_cuda() && scratch->scalar_type() == torch::kFloat32 && scratch->is_contiguous() && scratch->dim() >= 2,
                     "scratch must be a contiguous float32 [slots][...] tensor");
-        TORCH_CHECK(scratch->stride(0) >= int64_t(c.channels) * (c.width - 1), "scratch must hold a window per slot");
+        TORCH_CHECK(scratch->stride(0) >= int64_t(c.channels) * window.size(3), "scratch must hold a window per slot");
         p.scratch = scratch->data_ptr<float>();
         p.scratch_slot = scratch->stride(0);
     }
@@ -273,7 +283,8 @@ void pool_conv_prompt(torch::Tensor& out, torch::Tensor& window, const torch::Te
     check_contiguous(window, "window", torch::kFloat32, 4);
     check_contiguous(stash, "stash", torch::kFloat32, 4);
     check_contiguous(pending, "pending", torch::kInt32, 3);
-    TORCH_CHECK(window.size(2) == c.channels && window.size(3) == c.width - 1, "window must be [layers][sequences][channels][width - 1]");
+    TORCH_CHECK(window.size(2) == c.channels, "window must be [layers][sequences][channels][(width - 1) * dilation]");
+    set_dilation(c, window.size(3));
     TORCH_CHECK(stash.size(0) == window.size(0) && stash.size(2) == capacity && stash.size(3) == c.channels,
                 "stash must be [layers][sequences][capacity][channels]");
     TORCH_CHECK(pending.size(0) == window.size(0) && pending.size(2) == rk::pool_conv_blocks(c.channels),
@@ -304,8 +315,9 @@ void conv_segments(torch::Tensor& out, const torch::Tensor& window_in, torch::Te
     rk::ConvInputs c = conv_inputs(out, x, weight, bias, silu);
     check_contiguous(window_in, "window_in", torch::kFloat32, 2);
     check_contiguous(window_out, "window_out", torch::kFloat32, 2);
-    TORCH_CHECK(window_in.size(0) == c.channels && window_in.size(1) == c.width - 1 && window_out.sizes() == window_in.sizes(),
-                "windows must be [channels][width - 1]");
+    TORCH_CHECK(window_in.size(0) == c.channels && window_out.sizes() == window_in.sizes(),
+                "windows must be [channels][(width - 1) * dilation]");
+    set_dilation(c, window_in.size(1));
     check_ok(rk::enqueue_conv_segments(c, window_in.data_ptr<float>(), window_out.data_ptr<float>(), static_cast<int>(x.size(0)),
                                        at::cuda::getCurrentCUDAStream()),
              "conv_segments");

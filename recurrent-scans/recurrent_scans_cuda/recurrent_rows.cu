@@ -371,33 +371,39 @@ bool valid_pool(const DeltaShape& d, const PoolDelta& p) {
 }
 
 // ---------------------------------------------------------------------------------------------- convolution
-template <int W>
-__device__ __forceinline__ float pool_conv_value(const float (&win)[W - 1], const float (&w)[W], float b, float xt, bool act) {
+// A causal depthwise convolution of W taps at dilation D: y[t] = act(b + sum_i w[i] x[t - (W - 1 - i) D]). The window
+// holds the last S = (W - 1) D inputs, oldest first, so tap i < W - 1 reads window[i D] and tap W - 1 the input.
+template <int W, int D> constexpr int kSpan = (W - 1) * D;
+
+template <int W, int D>
+__device__ __forceinline__ float pool_conv_value(const float (&win)[kSpan<W, D>], const float (&w)[W], float b, float xt,
+                                                 bool act) {
     float acc = b;
 #pragma unroll
-    for(int i = 0; i < W - 1; ++i) acc = fmaf(w[i], win[i], acc);
+    for(int i = 0; i < W - 1; ++i) acc = fmaf(w[i], win[i * D], acc);
     acc = fmaf(w[W - 1], xt, acc);
     return act ? acc / (1.f + expf(-acc)) : acc;
 }
-template <int W>
-__device__ __forceinline__ void pool_conv_shift(float (&win)[W - 1], float xt) {
+template <int W, int D>
+__device__ __forceinline__ void pool_conv_shift(float (&win)[kSpan<W, D>], float xt) {
 #pragma unroll
-    for(int i = 0; i < W - 2; ++i) win[i] = win[i + 1];
-    win[W - 2] = xt;
+    for(int i = 0; i < kSpan<W, D> - 1; ++i) win[i] = win[i + 1];
+    win[kSpan<W, D> - 1] = xt;
 }
 
 // One layer of one row for one channel: the pending inputs shifted in, then the row's inputs.
-template <int W, class T>
+template <int W, int D, class T>
 __device__ __forceinline__ void conv_layer(const ConvInputs& c, const PoolConv& p, const Row& w, int layer, int ch, int n) {
-    float* window = p.window + layer * p.window_layer + w.sequence * p.window_sequence + std::int64_t(ch) * (W - 1);
+    constexpr int S = kSpan<W, D>;
+    float* window = p.window + layer * p.window_layer + w.sequence * p.window_sequence + std::int64_t(ch) * S;
     const float* stash_in = p.stash + layer * p.stash_layer + w.sequence * p.stash_sequence;
-    float win[W - 1];
+    float win[S];
 #pragma unroll
-    for(int i = 0; i < W - 1; ++i) win[i] = window[i];
-    for(int t = 0; t < n; ++t) pool_conv_shift<W>(win, stash_in[std::int64_t(t) * c.channels + ch]);
+    for(int i = 0; i < S; ++i) win[i] = window[i];
+    for(int t = 0; t < n; ++t) pool_conv_shift<W, D>(win, stash_in[std::int64_t(t) * c.channels + ch]);
     if(n)
 #pragma unroll
-        for(int i = 0; i < W - 1; ++i) window[i] = win[i];
+        for(int i = 0; i < S; ++i) window[i] = win[i];
     if(w.kind == kFlush || w.count <= 0) return;
     float wt[W];
 #pragma unroll
@@ -407,18 +413,18 @@ __device__ __forceinline__ void conv_layer(const ConvInputs& c, const PoolConv& 
     for(int t = 0; t < w.count; ++t) {
         const std::int64_t row = w.first + t;
         const float xt = as_float<T>(static_cast<const T*>(c.x)[row * c.x_row + ch]);
-        static_cast<T*>(c.out)[row * c.out_row + ch] = of_float<T>(pool_conv_value<W>(win, wt, b, xt, c.silu));
-        pool_conv_shift<W>(win, xt);
+        static_cast<T*>(c.out)[row * c.out_row + ch] = of_float<T>(pool_conv_value<W, D>(win, wt, b, xt, c.silu));
+        pool_conv_shift<W, D>(win, xt);
         if(w.kind == kStash && t < p.capacity) stash_out[std::int64_t(t) * c.channels + ch] = xt;
     }
     if(w.kind == kFinal) {
-        float* to = p.scratch + std::int64_t(w.slot) * p.scratch_slot + std::int64_t(ch) * (W - 1);
+        float* to = p.scratch + std::int64_t(w.slot) * p.scratch_slot + std::int64_t(ch) * S;
 #pragma unroll
-        for(int i = 0; i < W - 1; ++i) to[i] = win[i];
+        for(int i = 0; i < S; ++i) to[i] = win[i];
     }
 }
 
-template <int W, class T>
+template <int W, int D, class T>
 __global__ void __launch_bounds__(kPoolConvThreads) pool_conv_kernel(ConvInputs c, PoolConv p, RowSource src, int layers) {
     const Row w = row_of(src, blockIdx.y);
     const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x;
@@ -439,48 +445,54 @@ __global__ void __launch_bounds__(kPoolConvThreads) pool_conv_kernel(ConvInputs 
             *pending = 0;
         }
         __syncthreads();
-        if(ch < c.channels) conv_layer<W, T>(c, p, w, layer, ch, s_n);
+        if(ch < c.channels) conv_layer<W, D, T>(c, p, w, layer, ch, s_n);
     }
 }
 
 // One long row, thread per (channel, kPoolConvSegment rows), recurrent_kernels.cu's conv_segments_kernel over pool windows.
-template <int W, class T>
+template <int W, int D, class T>
 __global__ void __launch_bounds__(kPoolConvThreads) conv_segments_kernel(ConvInputs c, const float* window_in, float* window_out,
                                                                          int rows) {
+    constexpr int S = kSpan<W, D>;
     const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x, t0 = blockIdx.y * kPoolConvSegment;
     if(ch >= c.channels) return;
     const T* x = static_cast<const T*>(c.x);
     const int n = min(kPoolConvSegment, rows - t0);
-    float win[W - 1], wt[W];
+    float win[S], wt[W];
 #pragma unroll
-    for(int i = 0; i < W - 1; ++i)
-        win[i] = t0 ? as_float<T>(x[std::int64_t(t0 - (W - 1) + i) * c.x_row + ch]) : window_in[std::int64_t(ch) * (W - 1) + i];
+    for(int i = 0; i < S; ++i) {   // the S inputs before the segment: the row's, or the window's before the row
+        const int at = t0 - S + i;
+        win[i] = at >= 0 ? as_float<T>(x[std::int64_t(at) * c.x_row + ch]) : window_in[std::int64_t(ch) * S + S + at];
+    }
 #pragma unroll
     for(int i = 0; i < W; ++i) wt[i] = c.weight[std::int64_t(ch) * W + i];
     const float b = c.bias ? c.bias[ch] : 0.f;
     for(int i = 0; i < n; ++i) {
         const int t = t0 + i;
         const float xt = as_float<T>(x[std::int64_t(t) * c.x_row + ch]);
-        static_cast<T*>(c.out)[std::int64_t(t) * c.out_row + ch] = of_float<T>(pool_conv_value<W>(win, wt, b, xt, c.silu));
-        pool_conv_shift<W>(win, xt);
+        static_cast<T*>(c.out)[std::int64_t(t) * c.out_row + ch] = of_float<T>(pool_conv_value<W, D>(win, wt, b, xt, c.silu));
+        pool_conv_shift<W, D>(win, xt);
     }
     if(blockIdx.y == 0)
 #pragma unroll
-        for(int i = 0; i < W - 1; ++i) {   // the last W - 1 inputs, from the window where the row is shorter
-            const int at = rows - (W - 1) + i;
-            window_out[std::int64_t(ch) * (W - 1) + i] =
-                at >= 0 ? as_float<T>(x[std::int64_t(at) * c.x_row + ch]) : window_in[std::int64_t(ch) * (W - 1) + (W - 1) + at];
+        for(int i = 0; i < S; ++i) {   // the last S inputs, from the window where the row is shorter
+            const int at = rows - S + i;
+            window_out[std::int64_t(ch) * S + i] =
+                at >= 0 ? as_float<T>(x[std::int64_t(at) * c.x_row + ch]) : window_in[std::int64_t(ch) * S + S + at];
         }
 }
 
 // One sequence's prompt chunk padded to `rows` tokens (a captured graph's bucket): meta [5] on the device (first unused,
 // count, sequence, kind unused, slot unused). Thread per (channel, kPoolConvSegment rows): the chunk's first `count`
-// rows convolve from the sequence's window after its pending count (segment 0 applies and consumes it), later rows
-// (padding) output zeros; segment 0 writes the window after the count real inputs in place. A sequence below 0
-// (padding alone) outputs zeros and touches no window. The bits of pool_conv's and conv_segments'.
-template <int W, class T>
+// rows convolve from the sequence's window after its pending count (segment 0 applies and consumes it; a later segment
+// starts past the window's reach, S <= kPoolConvSegment), later rows (padding) output zeros; segment 0 writes the window
+// after the count real inputs in place. A sequence below 0 (padding alone) outputs zeros and touches no window. The
+// bits of pool_conv's and conv_segments'.
+template <int W, int D, class T>
 __global__ void __launch_bounds__(kPoolConvThreads) prompt_conv_kernel(ConvInputs c, PoolConv p, const std::int32_t* meta,
                                                                       int rows) {
+    constexpr int S = kSpan<W, D>;
+    static_assert(S <= kPoolConvSegment, "a segment past the first reads its window from the chunk");
     const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x, t0 = blockIdx.y * kPoolConvSegment;
     const int count = min(max(meta[1], 0), rows), sequence = meta[2];
     const int n = min(kPoolConvSegment, rows - t0);
@@ -500,22 +512,19 @@ __global__ void __launch_bounds__(kPoolConvThreads) prompt_conv_kernel(ConvInput
         for(int i = 0; i < n; ++i) out[(t0 + std::int64_t(i)) * c.out_row + ch] = of_float<T>(0.f);
         return;
     }
-    float* window = p.window + sequence * p.window_sequence + std::int64_t(ch) * (W - 1);
-    float win[W - 1], start[W - 1], wt[W];
+    float* window = p.window + sequence * p.window_sequence + std::int64_t(ch) * S;
+    float win[S], start[S], wt[W];
     if(t0 == 0) {
         const float* stash_in = p.stash + sequence * p.stash_sequence;
 #pragma unroll
-        for(int i = 0; i < W - 1; ++i) win[i] = window[i];
-        for(int t = 0; t < pending; ++t) pool_conv_shift<W>(win, stash_in[std::int64_t(t) * c.channels + ch]);
+        for(int i = 0; i < S; ++i) win[i] = window[i];
+        for(int t = 0; t < pending; ++t) pool_conv_shift<W, D>(win, stash_in[std::int64_t(t) * c.channels + ch]);
     } else {
 #pragma unroll
-        for(int i = 0; i < W - 1; ++i) {
-            const int at = t0 - (W - 1) + i;
-            win[i] = as_float<T>(x[std::int64_t(at) * c.x_row + ch]);
-        }
+        for(int i = 0; i < S; ++i) win[i] = as_float<T>(x[std::int64_t(t0 - S + i) * c.x_row + ch]);
     }
 #pragma unroll
-    for(int i = 0; i < W - 1; ++i) start[i] = win[i];
+    for(int i = 0; i < S; ++i) start[i] = win[i];
 #pragma unroll
     for(int i = 0; i < W; ++i) wt[i] = c.weight[std::int64_t(ch) * W + i];
     const float b = c.bias ? c.bias[ch] : 0.f;
@@ -523,73 +532,80 @@ __global__ void __launch_bounds__(kPoolConvThreads) prompt_conv_kernel(ConvInput
         const int t = t0 + i;
         if(t < count) {
             const float xt = as_float<T>(x[std::int64_t(t) * c.x_row + ch]);
-            out[std::int64_t(t) * c.out_row + ch] = of_float<T>(pool_conv_value<W>(win, wt, b, xt, c.silu));
-            pool_conv_shift<W>(win, xt);
+            out[std::int64_t(t) * c.out_row + ch] = of_float<T>(pool_conv_value<W, D>(win, wt, b, xt, c.silu));
+            pool_conv_shift<W, D>(win, xt);
         } else {
             out[std::int64_t(t) * c.out_row + ch] = of_float<T>(0.f);
         }
     }
     if(t0 == 0)
 #pragma unroll
-        for(int i = 0; i < W - 1; ++i) {   // the last W - 1 inputs, from the window where the chunk is shorter
-            const int at = count - (W - 1) + i;
-            window[i] = at >= 0 ? as_float<T>(x[std::int64_t(at) * c.x_row + ch]) : start[(W - 1) + at];
+        for(int i = 0; i < S; ++i) {   // the last S inputs, from the window where the chunk is shorter
+            const int at = count - S + i;
+            window[i] = at >= 0 ? as_float<T>(x[std::int64_t(at) * c.x_row + ch]) : start[S + at];
         }
 }
 
-template <int W, class T>
-cudaError_t conv_launch(const ConvInputs& c, const PoolConv* p, const RowSource* s, int layers, const float* in, float* out,
-                        int rows, cudaStream_t stream) {
-    const int blocks = (c.channels + kPoolConvThreads - 1) / kPoolConvThreads;
-    if(p) pool_conv_kernel<W, T><<<dim3(blocks, s->rows), kPoolConvThreads, 0, stream>>>(c, *p, *s, layers);
-    else conv_segments_kernel<W, T><<<dim3(blocks, (rows + kPoolConvSegment - 1) / kPoolConvSegment), kPoolConvThreads, 0, stream>>>(c, in, out, rows);
-    return cudaGetLastError();
+// The kernels' (taps, dilation) shapes: 2 .. 8 taps undilated, 2 .. 4 taps at dilation 2 .. 4 (pool_conv_supported).
+template <int W_, int D_> struct ConvShape { static constexpr int W = W_, D = D_; };
+template <class F>
+cudaError_t by_shape(int width, int dilation, F&& f) {
+    switch(dilation * 16 + width) {
+    case 16 + 2: return f(ConvShape<2, 1>{});
+    case 16 + 3: return f(ConvShape<3, 1>{});
+    case 16 + 4: return f(ConvShape<4, 1>{});
+    case 16 + 5: return f(ConvShape<5, 1>{});
+    case 16 + 6: return f(ConvShape<6, 1>{});
+    case 16 + 7: return f(ConvShape<7, 1>{});
+    case 16 + 8: return f(ConvShape<8, 1>{});
+    case 32 + 2: return f(ConvShape<2, 2>{});
+    case 32 + 3: return f(ConvShape<3, 2>{});
+    case 32 + 4: return f(ConvShape<4, 2>{});
+    case 48 + 2: return f(ConvShape<2, 3>{});
+    case 48 + 3: return f(ConvShape<3, 3>{});
+    case 48 + 4: return f(ConvShape<4, 3>{});
+    case 64 + 2: return f(ConvShape<2, 4>{});
+    case 64 + 3: return f(ConvShape<3, 4>{});
+    case 64 + 4: return f(ConvShape<4, 4>{});
+    default: return cudaErrorInvalidValue;
+    }
 }
+
 template <class T>
-cudaError_t conv_width(const ConvInputs& c, const PoolConv* p, const RowSource* s, int layers, const float* in, float* out,
+cudaError_t conv_typed(const ConvInputs& c, const PoolConv* p, const RowSource* s, int layers, const float* in, float* out,
                        int rows, cudaStream_t stream) {
-    switch(c.width) {
-    case 2: return conv_launch<2, T>(c, p, s, layers, in, out, rows, stream);
-    case 3: return conv_launch<3, T>(c, p, s, layers, in, out, rows, stream);
-    case 4: return conv_launch<4, T>(c, p, s, layers, in, out, rows, stream);
-    case 5: return conv_launch<5, T>(c, p, s, layers, in, out, rows, stream);
-    case 6: return conv_launch<6, T>(c, p, s, layers, in, out, rows, stream);
-    case 7: return conv_launch<7, T>(c, p, s, layers, in, out, rows, stream);
-    default: return conv_launch<8, T>(c, p, s, layers, in, out, rows, stream);
-    }
-}
-template <int W, class T>
-cudaError_t prompt_launch(const ConvInputs& c, const PoolConv& p, const std::int32_t* meta, int rows, cudaStream_t stream) {
     const int blocks = (c.channels + kPoolConvThreads - 1) / kPoolConvThreads;
-    prompt_conv_kernel<W, T><<<dim3(blocks, (rows + kPoolConvSegment - 1) / kPoolConvSegment), kPoolConvThreads, 0, stream>>>(
-        c, p, meta, rows);
-    return cudaGetLastError();
+    return by_shape(c.width, c.dilation, [&](auto shape) {
+        constexpr int W = decltype(shape)::W, D = decltype(shape)::D;
+        if(p) pool_conv_kernel<W, D, T><<<dim3(blocks, s->rows), kPoolConvThreads, 0, stream>>>(c, *p, *s, layers);
+        else conv_segments_kernel<W, D, T><<<dim3(blocks, (rows + kPoolConvSegment - 1) / kPoolConvSegment), kPoolConvThreads, 0,
+                                             stream>>>(c, in, out, rows);
+        return cudaGetLastError();
+    });
 }
 template <class T>
-cudaError_t prompt_width(const ConvInputs& c, const PoolConv& p, const std::int32_t* meta, int rows, cudaStream_t stream) {
-    switch(c.width) {
-    case 2: return prompt_launch<2, T>(c, p, meta, rows, stream);
-    case 3: return prompt_launch<3, T>(c, p, meta, rows, stream);
-    case 4: return prompt_launch<4, T>(c, p, meta, rows, stream);
-    case 5: return prompt_launch<5, T>(c, p, meta, rows, stream);
-    case 6: return prompt_launch<6, T>(c, p, meta, rows, stream);
-    case 7: return prompt_launch<7, T>(c, p, meta, rows, stream);
-    default: return prompt_launch<8, T>(c, p, meta, rows, stream);
-    }
+cudaError_t prompt_typed(const ConvInputs& c, const PoolConv& p, const std::int32_t* meta, int rows, cudaStream_t stream) {
+    const int blocks = (c.channels + kPoolConvThreads - 1) / kPoolConvThreads;
+    return by_shape(c.width, c.dilation, [&](auto shape) {
+        constexpr int W = decltype(shape)::W, D = decltype(shape)::D;
+        prompt_conv_kernel<W, D, T><<<dim3(blocks, (rows + kPoolConvSegment - 1) / kPoolConvSegment), kPoolConvThreads, 0,
+                                      stream>>>(c, p, meta, rows);
+        return cudaGetLastError();
+    });
 }
 cudaError_t prompt_dispatch(const ConvInputs& c, const PoolConv& p, const std::int32_t* meta, int rows, cudaStream_t stream) {
     switch(c.dtype) {
-    case Scalar::bf16: return prompt_width<__nv_bfloat16>(c, p, meta, rows, stream);
-    case Scalar::f16: return prompt_width<__half>(c, p, meta, rows, stream);
-    default: return prompt_width<float>(c, p, meta, rows, stream);
+    case Scalar::bf16: return prompt_typed<__nv_bfloat16>(c, p, meta, rows, stream);
+    case Scalar::f16: return prompt_typed<__half>(c, p, meta, rows, stream);
+    default: return prompt_typed<float>(c, p, meta, rows, stream);
     }
 }
 cudaError_t conv_dispatch(const ConvInputs& c, const PoolConv* p, const RowSource* s, int layers, const float* in, float* out,
                           int rows, cudaStream_t stream) {
     switch(c.dtype) {
-    case Scalar::bf16: return conv_width<__nv_bfloat16>(c, p, s, layers, in, out, rows, stream);
-    case Scalar::f16: return conv_width<__half>(c, p, s, layers, in, out, rows, stream);
-    default: return conv_width<float>(c, p, s, layers, in, out, rows, stream);
+    case Scalar::bf16: return conv_typed<__nv_bfloat16>(c, p, s, layers, in, out, rows, stream);
+    case Scalar::f16: return conv_typed<__half>(c, p, s, layers, in, out, rows, stream);
+    default: return conv_typed<float>(c, p, s, layers, in, out, rows, stream);
     }
 }
 
@@ -633,8 +649,12 @@ cudaError_t enqueue_pool_delta_replay(const DeltaShape& d, const PoolDelta& p, c
 
 int pool_conv_blocks(int channels) { return channels < 1 ? 0 : (channels + kPoolConvThreads - 1) / kPoolConvThreads; }
 
+bool pool_conv_supported(int width, int dilation) {
+    return dilation == 1 ? width >= 2 && width <= kPoolMaxConv : width >= 2 && width <= 4 && dilation >= 2 && dilation <= 4;
+}
+
 cudaError_t enqueue_pool_conv(const ConvInputs& c, const PoolConv& p, const RowSource& s, int layers, cudaStream_t stream) {
-    if(!valid_source(s, true) || layers < 1 || c.channels < 1 || c.width < 2 || c.width > kPoolMaxConv || !c.weight || !p.window ||
+    if(!valid_source(s, true) || layers < 1 || c.channels < 1 || !pool_conv_supported(c.width, c.dilation) || !c.weight || !p.window ||
        !p.stash || !p.pending || p.capacity < 1 || (c.x && c.out == c.x))
         return cudaErrorInvalidValue;
     if(!s.rows) return cudaSuccess;
@@ -643,7 +663,7 @@ cudaError_t enqueue_pool_conv(const ConvInputs& c, const PoolConv& p, const RowS
 
 cudaError_t enqueue_pool_conv_prompt(const ConvInputs& c, const PoolConv& p, const std::int32_t* meta, int rows,
                                      cudaStream_t stream) {
-    if(rows < 0 || c.channels < 1 || c.width < 2 || c.width > kPoolMaxConv || !c.x || !c.out || !c.weight || !p.window ||
+    if(rows < 0 || c.channels < 1 || !pool_conv_supported(c.width, c.dilation) || !c.x || !c.out || !c.weight || !p.window ||
        !p.stash || !p.pending || !meta || p.capacity < 1 || c.out == c.x || (rows + kPoolConvSegment - 1) / kPoolConvSegment > 65535)
         return cudaErrorInvalidValue;
     if(!rows) return cudaSuccess;
@@ -651,7 +671,7 @@ cudaError_t enqueue_pool_conv_prompt(const ConvInputs& c, const PoolConv& p, con
 }
 
 cudaError_t enqueue_conv_segments(const ConvInputs& c, const float* window_in, float* window_out, int rows, cudaStream_t stream) {
-    if(rows < 0 || c.channels < 1 || c.width < 2 || c.width > kPoolMaxConv || !c.x || !c.out || !c.weight || !window_in ||
+    if(rows < 0 || c.channels < 1 || !pool_conv_supported(c.width, c.dilation) || !c.x || !c.out || !c.weight || !window_in ||
        !window_out || c.out == c.x || (rows + kPoolConvSegment - 1) / kPoolConvSegment > 65535)
         return cudaErrorInvalidValue;
     if(!rows) return cudaSuccess;

@@ -119,10 +119,13 @@ struct ConvInputs {
     std::int64_t x_row = 0, out_row = 0;
     const float* weight = nullptr;          // [channels][width]
     const float* bias = nullptr;            // [channels] or null
-    int channels = 0, width = 0;            // width 2 .. 8
+    int channels = 0, width = 0;            // taps (width) and their dilation: pool_conv_supported(width, dilation)
+    int dilation = 1;                       // a window holds the last (width - 1) * dilation inputs
     bool silu = true;
 };
 int pool_conv_blocks(int channels);
+// The convolutions the kernels run: 2 .. 8 taps undilated, 2 .. 4 taps at dilation 2 .. 4.
+bool pool_conv_supported(int width, int dilation);
 // Rows of kStash (deferred window: apply the pending count, convolve from the window without writing it, stash the
 // inputs), kFinal (convolve, the window after the last input into the scratch) or kFlush, over `layers` layers (a block
 // walks them). out must not be x.
