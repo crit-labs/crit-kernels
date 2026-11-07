@@ -13,6 +13,7 @@ reference, how a kernel is verified against it).
 | --- | --- | --- |
 | [decode-gemv](decode-gemv/CARD.md) | `crit-labs/decode-gemv` | quantized-projections: weight-only decode GEMVs for 1-16 rows (NVFP4 W4A16, FP8 and MXFP8 W8A16, BF16), each row's bits independent of the rows beside it; NVFP4 decoders for prompt GEMMs |
 | [mma-rows](mma-rows/CARD.md) | `crit-labs/mma-rows` | quantized-projections: projections of 1-64 rows on tensor cores in one fixed tile (NVFP4, FP8, MXFP8, BF16 weights; 16-bit or prompt-quantized activations), each weight read once a call and a row's bits independent of the rows beside it; the FP8-row and NVFP4 activation quantizers |
+| [pinned-gemm](pinned-gemm/CARD.md) | `crit-labs/pinned-gemm` | quantized-projections: prompt GEMMs whose rows do not depend on the row count (cuBLASLt with one split-K-free algorithm per shape and format for every row count: BF16, FP16, FP8, MXFP8, MXFP4, NVFP4) |
 | [fixed-tile-gemm](fixed-tile-gemm/CARD.md) | `crit-labs/fixed-tile-gemm` | quantized-projections: a row-invariant prompt GEMM (BF16/FP16, Triton) |
 | [workbench-starter](workbench-starter/CARD.md) | `crit-labs/workbench-starter` | crit's kernel workbench: the starter matmul (bf16, fp8) `crit kernels new --starter --from` copies |
 | [fp8-block-rows](fp8-block-rows/CARD.md) | `crit-labs/fp8-block-rows` | quantized-projections: matched FP8 projections (E4M3 weights and activations, block or row scales) and the order's device reference with its fixture (tests/order, tests/fp8_block_order_tests.cu) |

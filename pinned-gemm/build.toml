@@ -1,0 +1,28 @@
+[general]
+name = "pinned-gemm"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+edition = 6
+
+[general.hub]
+repo-id = "crit-labs/pinned-gemm"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.pinned_gemm]
+language = "cpp-cuda"
+depends = ["torch"]
+# Host code only: it runs cuBLASLt's own kernels, which cuBLASLt offers per GPU (FP8 from sm_89, the block-scaled
+# MXFP8 and NVFP4 formats from sm_100).
+cuda-capabilities = ["8.0", "8.6", "8.9", "9.0", "10.0a", "10.3a", "11.0a", "12.0a", "12.1a"]
+src = [
+  "pinned_gemm_cuda/pinned_gemm.cu",
+  "pinned_gemm_cuda/pinned_gemm.h",
+]
