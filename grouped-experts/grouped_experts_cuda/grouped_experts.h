@@ -59,11 +59,12 @@ cudaError_t enqueue_plan(const long long* ids64, const int* ids32, int routes, i
 cudaError_t enqueue_items(const long long* order, const int* counts, const int* starts, const int* item_end,
                           int experts, const int* slots, const Items& items, cudaStream_t stream);
 // h [routes][inter] BF16: SwiGLU(gate, up) of every planned route (x [tokens][hidden] BF16 rows, route r reads token
-// r / top). a4: nvfp4 inputs quantized at each expert's input scale, h quantized at its down input scale; with items
-// of width 8 (decode) and a4, x is the routes' operands enqueue_a4_inputs made ([routes][hidden], top 1).
+// r / top). a4: x is the routes' W4A4 operands enqueue_a4_inputs made ([routes][hidden], top 1), h quantized at the
+// expert's down input scale.
 cudaError_t enqueue_gate_up(const __nv_bfloat16* x, int top, const std::uint8_t* store, const Layout& layout, bool a4,
                             const Items& items, __nv_bfloat16* h, cudaStream_t stream);
-// The W4A4 gate/up operands of every planned route, out [routes][hidden] BF16, for decode items (width 8).
+// The W4A4 gate/up operands of every planned route, out [routes][hidden] BF16: x quantized once per route at its
+// expert's input scale by crit's declared quantizer (operand e2m1 x decoded scale, exact in BF16).
 cudaError_t enqueue_a4_inputs(const __nv_bfloat16* x, int top, const std::uint8_t* store, const Layout& layout,
                               const Items& items, __nv_bfloat16* out, cudaStream_t stream);
 // y [routes][hidden] FP32: the down rows of every planned route, unweighted.

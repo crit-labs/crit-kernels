@@ -14,9 +14,17 @@ sort beyond), runs every routed expert's gate/up rows, SwiGLU and down rows once
 cores, and sums each token's routes in route order. No host synchronization: every grid is launched at its largest
 size and exits on the device's item count, so a call at a fixed token count is captured in a CUDA graph.
 
-**A route's bits never depend on the rows beside it**: a warp owns 16 rows of one expert and every route of its item,
+**A route's bits never depend on the rows beside it**: a warp owns rows of one expert and every route of its item,
 and each output is one chain of MMAs over k in ascending 64-element blocks whatever the item size, the chunk or the
-other routes. Decode rows (items of 8 routes) and prompt chunks (items of 32) compute the same function bit for bit.
+other routes. Decode rows (items of 8 routes: 8 inter rows a warp, 4-bit codes decoded through a shared byte table,
+operands read straight from global memory) and prompt chunks (items of 32 routes, 64 on request: operands staged in
+shared memory by cp.async, the next chunk landing while the current one computes) compute the same function bit for
+bit. W4A4 inputs are quantized once per route (a pre-pass) for both.
+
+**Two arithmetics.** `tensor` (the default): BF16 tensor cores for every format. `declared`: crit's integer block order
+(host-expert-arithmetic's host_int.h, which crit's CPU expert tier computes) for nvfp4 W4A4 and int4 W4A8, so a route
+computed on the CPU has the device's bits: exact int32 block dots (dp4a), block b to lane b % 16, fmaf of the dot by the
+rounded product of the scales, the halving tree, times the row's post; the declared SwiGLU and quantizers.
 
 **A baseline to replace**: measure a provider's grouped GEMM on the format's own tensor cores against it on the
 engine's shapes, and keep the faster one that keeps the same row invariance.
@@ -30,7 +38,7 @@ engine's shapes, and keep the faster one that keeps the same row invariance.
 | GPUs | NVIDIA sm_80 and newer (mma.sync m16n8k16 BF16, no architecture-specific instruction; E4M3 conversion in hardware from sm_89) |
 | Shapes | hidden and inter multiples of 64; any token count up to 65,535 items a call, any top-k and expert count (< 2^22) |
 | Numerics | weights decoded exactly to BF16 (every format's code times its block scale is exact in BF16); FP32 MMA sums; per-row factors on the FP32 sums; fp8 block scales fmaf'd per 128-k block; crit's declared SwiGLU (IEEE operations only); the intermediate rounded to BF16 (or quantized, W4A4); the combine sum = fmaf(weight, row, sum) in route order |
-| Determinism | the same bits on a repeat, alone or batched, in 8- and 32-route items, through either plan, and on graph replay (tests) |
+| Determinism | the same bits on a repeat, alone or batched, in 8-, 32- and 64-route items, through either plan, and on graph replay (tests); the declared arithmetic equal to an exact oracle of host_int's order (tests) |
 | Accuracy | within 5e-3 of the largest output of an FP64 block over the same decoded weights (3e-2 for W4A4) in every format (tests, RTX 5090) |
 | Measured speed | see below |
 
@@ -41,6 +49,7 @@ gx = kernels.get_kernel("crit-labs/grouped-experts", version=1)
 ws = gx.Workspace(tokens, top, experts, hidden, inter, device)     # the buffers of one call shape, made once
 out = gx.forward(x, ids, weights, store, slots, layout, ws, a4)    # [tokens][hidden] FP32
 y = gx.route_outputs(x, ids, store, slots, layout, ws, a4)        # unweighted rows [tokens * top][hidden]
+y = gx.route_outputs(x, ids, store, slots, layout, ws, arithmetic="declared")   # nvfp4 W4A4 / int4 W4A8, CPU-exact
 out = gx.combine(y, ids, weights, slots, experts)                  # route order; negative slots skipped
 values, scales = gx.quantize_e2m1x2(x, global_scale)               # crit's declared NVFP4 quantizer
 ```

@@ -29,9 +29,9 @@ SMALL_PLAN = 1024   # routes the one-block plan takes; larger calls group their 
 
 
 def width_for(routes, experts):
-    """Routes per item: 64 once a call averages 24 or more routes per expert, 32 from 8, else 8 (decode rows). The width
-    changes the speed only, never a route's bits."""
-    return 64 if routes >= 24 * experts else 32 if routes >= 8 * experts else 8
+    """Routes per item: 32 once a call averages 8 or more routes per expert (prompt chunks), else 8 (decode rows); 64
+    is a choice of the caller's (Workspace(width=64)). The width changes the speed only, never a route's bits."""
+    return 32 if routes >= 8 * experts else 8
 
 
 class Workspace:
@@ -111,7 +111,7 @@ def route_outputs(x, ids, store, slots, layout, ws, a4=False, arithmetic="tensor
         ops.declared_intermediate(d["gu"], store, list(layout), *items, d["h"], d["hs"])
         ops.declared_rows(d["h"], d["hs"], store, list(layout), False, *items, ws.y)
         return ws.y
-    if a4 and ws.width == 8:   # decode items read their W4A4 operands, quantized once per route
+    if a4:   # the W4A4 operands, quantized once per route at its expert's input scale
         if ws.xa is None:
             ws.xa = torch.zeros(ws.routes, ws.hidden, dtype=torch.bfloat16, device=ws.device)
         ops.a4_inputs(x, ws.top, store, list(layout), *items, ws.xa)

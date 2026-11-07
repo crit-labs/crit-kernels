@@ -143,10 +143,11 @@ struct Raw {
 
 template <int F, int TILES>
 __host__ __device__ constexpr int depth() {   // 64-k blocks of weights in flight per warp (deeper with fewer rows)
-    return F == int(Format::bf16) ? (TILES == 1 ? 3 : 2)
-           : (F == int(Format::fp8_channel) || F == int(Format::fp8_block)) ? (TILES == 1 ? 4 : 3)
-           : (TILES == 1 ? 6 : 4);
+    return F == int(Format::bf16) ? (TILES == 1 ? 4 : 2)
+           : (F == int(Format::fp8_channel) || F == int(Format::fp8_block)) ? (TILES == 1 ? 6 : 3)
+           : (TILES == 1 ? 8 : 4);
 }
+constexpr int kOperandDepth = 2;   // decode items: 64-k blocks of B operands in flight (from L2: x and h are small)
 
 // The lane's 16 weights k .. k + 15 of `row` (k a multiple of 16).
 template <int F>
@@ -202,6 +203,41 @@ __device__ __forceinline__ void decode(const Raw<F>& r, uint32_t* f) {
     }
 }
 
+// 4-bit codes through a table in shared memory: byte -> the BF16 pair of its two codes (low nibble first), exact;
+// the decode items' weights cost a lookup and a multiply a pair.
+template <int F>
+constexpr bool kFour = F == int(Format::nvfp4) || F == int(Format::int4) || F == int(Format::mxfp4);
+
+template <int F>
+__device__ __forceinline__ void pair_table(uint32_t* table) {
+    for(int b = threadIdx.x; b < 256; b += blockDim.x) {
+        float v[2];
+#pragma unroll
+        for(int h = 0; h < 2; ++h) {
+            const int code = (b >> (4 * h)) & 15;
+            if constexpr(F == int(Format::int4)) v[h] = float(code < 8 ? code : code - 16);
+            else v[h] = (code & 8) ? -e2m1_magnitude(code & 7) : e2m1_magnitude(code & 7);
+        }
+        table[b] = u32(__floats2bfloat162_rn(v[0], v[1]));
+    }
+}
+
+template <int F>
+__device__ __forceinline__ void decode_table(const Raw<F>& r, const uint32_t* table, uint32_t* f) {
+    bf162 s2;
+    if constexpr(F == int(Format::mxfp4)) {
+        const uint32_t bits = (r.s & 0xFFu) << 7;
+        s2 = b2(bits | (bits << 16));
+    } else {
+        const bf16 s = __float2bfloat16_rn(e4m3_value(r.s));
+        s2 = __halves2bfloat162(s, s);
+    }
+#pragma unroll
+    for(int w = 0; w < 2; ++w)
+#pragma unroll
+        for(int i = 0; i < 4; ++i) f[4 * w + i] = u32(__hmul2(b2(table[(r.w[w] >> (8 * i)) & 0xFFu]), s2));
+}
+
 // ----------------------------------------------------------------------------------------------- the expert pass
 
 struct Pass {
@@ -229,48 +265,24 @@ __device__ __forceinline__ float row_factor(const std::uint8_t* bundle, const La
     }
 }
 
-// Stage the item's inputs k0 .. k0 + count into shared memory, [route][chunk + pad] BF16; a4 quantizes x per 16.
-template <bool QUANTIZE>
-__device__ __forceinline__ void stage(const Pass& p, const int* routes, int rows, int K, int k0, int count, float g,
-                                      bf16* tile) {
-    const int width = p.chunk + kPad;
-    if constexpr(!QUANTIZE) {
-        const int per = count / 8;
-        for(int i = threadIdx.x; i < rows * per; i += blockDim.x) {
-            const int j = i / per, c = (i % per) * 8, r = routes[j];
-            uint4 v = make_uint4(0u, 0u, 0u, 0u);
-            if(r >= 0) v = __ldg(reinterpret_cast<const uint4*>(p.in + static_cast<long long>(r / p.in_div) * K + k0 + c));
-            *reinterpret_cast<uint4*>(tile + j * width + c) = v;
-        }
-    } else {
-        const int per = count / 16;
-        for(int i = threadIdx.x; i < rows * per; i += blockDim.x) {
-            const int j = i / per, c = (i % per) * 16, r = routes[j];
-            uint4 out[2] = {make_uint4(0u, 0u, 0u, 0u), make_uint4(0u, 0u, 0u, 0u)};
-            if(r >= 0) {
-                const uint4* src = reinterpret_cast<const uint4*>(p.in + static_cast<long long>(r / p.in_div) * K + k0 + c);
-                const uint4 a = __ldg(src), b = __ldg(src + 1);
-                const uint32_t words[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-                float v[16], amax = 0.0f;
-#pragma unroll
-                for(int q = 0; q < 8; ++q) {
-                    const float2 f = __bfloat1622float2(b2(words[q]));
-                    v[2 * q] = f.x;
-                    v[2 * q + 1] = f.y;
-                    amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
-                }
-                const float decoded = block_scale(amax, g);
-                uint32_t* o = reinterpret_cast<uint32_t*>(out);
-#pragma unroll
-                for(int q = 0; q < 8; ++q)
-                    o[q] = u32(__floats2bfloat162_rn(e2m1_operand(v[2 * q], g, decoded),
-                                                     e2m1_operand(v[2 * q + 1], g, decoded)));
-            }
-            uint4* dst = reinterpret_cast<uint4*>(tile + j * width + c);
-            dst[0] = out[0];
-            dst[1] = out[1];
-        }
+__device__ __forceinline__ void copy16_async(void* dst, const void* src, bool valid) {
+    const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(valid ? 16 : 0));
+}
+__device__ __forceinline__ void copy_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void copy_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::); }
+
+// The item's 16-bit inputs k0 .. k0 + count into shared memory asynchronously (cp.async, zero-filled past the routes):
+// the next chunk lands while the current one computes.
+__device__ __forceinline__ void stage_async(const Pass& p, const int* routes, int rows, int K, int k0, int count,
+                                            bf16* tile) {
+    const int width = p.chunk + kPad, per = count / 8;
+    for(int i = threadIdx.x; i < rows * per; i += blockDim.x) {
+        const int j = i / per, c = (i % per) * 8, r = routes[j];
+        const bf16* src = p.in + static_cast<long long>(r >= 0 ? r / p.in_div : 0) * K + k0 + c;
+        copy16_async(tile + j * width + c, src, r >= 0);
     }
+    copy_commit();
 }
 
 // One block: item blockIdx.y, WARPS warps of TILES MMA row tiles each: down, 16 output rows a tile; gate/up, 8 inter
@@ -284,9 +296,12 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
     extern __shared__ __align__(16) unsigned char smem[];
     bf16* tile = reinterpret_cast<bf16*>(smem);
     __shared__ int routes[R];
+    constexpr bool kTable = NT == 1 && kFour<F>;   // decode items: 4-bit codes through a shared table
+    __shared__ uint32_t table[kTable ? 256 : 1];
     const int u = blockIdx.y;
     if(u >= *p.item_count) return;
     for(int j = threadIdx.x; j < R; j += blockDim.x) routes[j] = p.item_routes[static_cast<long long>(u) * R + j];
+    if constexpr(kTable) pair_table<F>(table);
     __syncthreads();
     int active = 0;
 #pragma unroll
@@ -312,7 +327,6 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
             rows[2 * t + 1] = r0 + 16 * t + 8 + g;
         }
     }
-    const float g_in = A4 && GATEUP ? reinterpret_cast<const float*>(bundle + L.input)[0] : 0.0f;
     float acc[TILES][NT][4], part[kBlock ? TILES : 1][kBlock ? NT : 1][4];
 #pragma unroll
     for(int t = 0; t < TILES; ++t)
@@ -332,13 +346,18 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
     // Decode items (one n-tile) read their B fragments straight from global memory (the routes' rows of x or h, or
     // the routes' W4A4 operands a pre-pass quantized): no staging, no barrier in the k loop; the same operands.
     constexpr bool kDirect = NT == 1;
+    // Prompt items stage chunk c + 1 into the other half of shared memory while chunk c computes (W4A4 inputs come
+    // quantized once per route from a4_inputs, so every input is plain BF16 here).
+    constexpr bool kAsync = !kDirect;
     const bf16* brow = nullptr;
     if constexpr(kDirect) {
         const int r = routes[g];
         brow = r >= 0 ? p.in + static_cast<long long>(r / p.in_div) * K + 16 * t4 : nullptr;
     }
     Raw<F> ring[D][ROWS];
-    uint4 bring[kDirect ? D : 1][2];
+    constexpr int DB = kDirect ? kOperandDepth : 1;
+    static_assert(D % DB == 0, "the operand ring divides the weight ring");
+    uint4 bring[DB][2];
     if(live) {
 #pragma unroll
         for(int d = 0; d < D; ++d)
@@ -346,45 +365,52 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
 #pragma unroll
                 for(int r = 0; r < ROWS; ++r) ring[d][r] = load_raw<F>(codes, scales, rows[r], K, 64 * d + 16 * t4);
                 if constexpr(kDirect) {
-                    if(brow) {
-                        bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d));
-                        bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d) + 1);
-                    } else {
-                        bring[d][0] = bring[d][1] = make_uint4(0u, 0u, 0u, 0u);
+                    if(d < DB) {
+                        if(brow) {
+                            bring[d % DB][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d));
+                            bring[d % DB][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d) + 1);
+                        } else {
+                            bring[d % DB][0] = bring[d % DB][1] = make_uint4(0u, 0u, 0u, 0u);
+                        }
                     }
                 }
             }
     }
+    const int tile_elems = 8 * NT * width;
+    if constexpr(kAsync) stage_async(p, routes, 8 * active, K, 0, K < p.chunk ? K : p.chunk, tile);
     for(int b0 = 0; b0 < blocks; b0 += D) {
 #pragma unroll
         for(int d = 0; d < D; ++d) {
             const int kb = b0 + d;
             if(kb >= blocks) break;
             const int k = 64 * kb, kk = k % p.chunk;
-            if(!kDirect && kk == 0) {
+            if(kAsync && kk == 0) {   // chunk k / chunk landed; every warp is done with the other half
+                copy_wait_all();
                 __syncthreads();
-                const int count = K - k < p.chunk ? K - k : p.chunk;
-                stage<A4 && GATEUP>(p, routes, 8 * active, K, k, count, g_in, tile);
-                __syncthreads();
+                const int next = k + p.chunk;
+                if(next < K)
+                    stage_async(p, routes, 8 * active, K, next, K - next < p.chunk ? K - next : p.chunk,
+                                tile + ((next / p.chunk) & 1) * tile_elems);
             }
             if(!live) continue;
             uint32_t fr[ROWS][8];
 #pragma unroll
-            for(int r = 0; r < ROWS; ++r) decode<F>(ring[d][r], fr[r]);
+            for(int r = 0; r < ROWS; ++r) {
+                if constexpr(kTable) decode_table<F>(ring[d][r], table, fr[r]);
+                else decode<F>(ring[d][r], fr[r]);
+            }
             uint4 b_now[2];
             if constexpr(kDirect) {
-                b_now[0] = bring[d][0];
-                b_now[1] = bring[d][1];
+                b_now[0] = bring[d % DB][0];
+                b_now[1] = bring[d % DB][1];
+                if(brow && kb + DB < blocks) {
+                    bring[d % DB][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + DB)));
+                    bring[d % DB][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + DB)) + 1);
+                }
             }
             if(kb + D < blocks) {
 #pragma unroll
                 for(int r = 0; r < ROWS; ++r) ring[d][r] = load_raw<F>(codes, scales, rows[r], K, 64 * (kb + D) + 16 * t4);
-                if constexpr(kDirect) {
-                    if(brow) {
-                        bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)));
-                        bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)) + 1);
-                    }
-                }
             }
 #pragma unroll
             for(int n = 0; n < NT; ++n) {
@@ -394,7 +420,8 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
                     v0 = b_now[0];
                     v1 = b_now[1];
                 } else {
-                    const uint4* bp = reinterpret_cast<const uint4*>(tile + (8 * n + g) * width + kk + 16 * t4);
+                    const bf16* half = kAsync ? tile + ((k / p.chunk) & 1) * tile_elems : tile;
+                    const uint4* bp = reinterpret_cast<const uint4*>(half + (8 * n + g) * width + kk + 16 * t4);
                     v0 = bp[0];
                     v1 = bp[1];
                 }
@@ -859,7 +886,8 @@ cudaError_t launch(const Pass& base, const Items& items, cudaStream_t stream) {
     p.chunk = chunk_for(items.width, K);
     const int rows_per_block = kWarps * (GATEUP ? 8 : 16) * TILES;
     const dim3 grid((M + rows_per_block - 1) / rows_per_block, items.capacity);
-    const size_t bytes = NT == 1 ? 0 : static_cast<size_t>(8 * NT) * (p.chunk + kPad) * sizeof(bf16);
+    if(NT == 8) p.chunk = 128;   // two halves of 64 routes x 128 values within 48 KiB
+    const size_t bytes = NT == 1 ? 0 : static_cast<size_t>(2) * (8 * NT) * (p.chunk + kPad) * sizeof(bf16);
     expert_kernel<F, NT, TILES, kWarps, GATEUP, A4><<<grid, kWarps * 32, bytes, stream>>>(p);
     return cudaGetLastError();
 }
