@@ -27,14 +27,15 @@ device, not the cache's capacity, and one launch shape (a CUDA graph) serves eve
 unnormalized output with its running maximum and sum (the partials: one row per column, rows' columns packed by
 `offsets` or `columns` apart); a merge combines the partitions holding a column's keys in partition order.
 
-Every window launch over a cache takes one query tile and launch configuration (pinned(): rows by the KV head's query
-heads, two warps, three stages). Two warps are less than a warpgroup, so every GPU's tensor cores multiply the tile as
-mma.sync (sm_90's wgmma and sm_100's tcgen05 take four warps and 64 rows or more): one instruction shape and one
-summation order for every launch, and the row sums run on the tensor cores in a fixed order too. So a column's bits
+A window launch's query tile (tile_for) holds the launch's columns of a KV head's query heads: up to 32 rows in two
+warps, or 64 rows in four where the GPU multiplies four warps over 64 rows with mma.sync too (not sm_90's wgmma, not
+sm_100's tcgen05: there such windows take 32-row tiles): on each GPU one instruction shape and one summation order for
+every launch, and the row sums run on the tensor cores in a fixed order too. So a column's bits
 depend on its own keys and query, the partitions, the piece and the page kind only: not on the rows beside it, not on
 how many columns or rows its launch reads (one column decoded alone equals the same column inside a verify window).
-A launch given another tile or warp count keeps no such promise. The partitions rule, the piece size, the tile and its
-warps and stages are defaults measured on one sm_120 GPU (an RTX 5090). Past the first call of a shape nothing is
+A launch given another tile or warp count keeps that only where the GPU multiplies it with mma.sync too. The
+partitions rule, the piece size, the tiles and their warps and stages are defaults measured on one sm_120 GPU (an RTX
+5090). Past the first call of a shape nothing is
 allocated but an `out` the caller does not give (the partials live in a workspace that grows outside a capture only,
 or in the caller's), and nothing waits for the host.
 
@@ -50,7 +51,7 @@ import triton
 
 from . import _kernels
 
-__all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "TILE_ROWS", "attend", "partitions", "piece_size", "pinned", "prefill",
+__all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "attend", "partitions", "piece_size", "prefill", "tile_for",
            "workspace_floats", "write"]
 
 KINDS = {"bf16": 0, "fp16": 0, "fp8": 1, "fp8:row": 2, "int8": 3}
@@ -145,18 +146,28 @@ def write(keys, values, slots, key_pages, value_pages, kind, key_scales=None, va
                                        num_warps=1 if bd <= 128 else 2)
 
 
-TILE_ROWS = 32      # query rows of a window launch's tile (pinned): whole columns of one KV head's query heads
-WARPS, STAGES = 2, 3   # less than a warpgroup: mma.sync on every GPU
+NARROW_ROWS = 32                 # rows of the tiles every GPU multiplies with mma.sync
+WARPS, STAGES = 2, 3             # a tile of up to 32 rows
+WIDE_ROWS, WIDE_WARPS, WIDE_STAGES = 64, 4, 4   # a 64-row tile, where four warps over it stay mma.sync
+WARPGROUP_MMA = (9, 10, 11)      # major capabilities whose tensor cores take four warps over 64 rows as warpgroup MMA
 
 
-def pinned(group):
-    """(query rows, warps, pipeline stages) of every window launch over a cache whose KV heads serve `group` query
-    heads each: TILE_ROWS rows (a power of two of the group's heads where they need more), in two warps and three
-    stages. Two warps are less than a warpgroup, so every GPU's tensor cores multiply the tile as mma.sync (sm_90's
-    wgmma and sm_100's tcgen05 take four warps and 64 rows or more): one instruction shape and summation order for
-    every launch, whatever its rows and columns, so a column's bits are the same alone and in a verify window.
-    Measured on one sm_120 GPU (an RTX 5090): two warps and three stages read a 32-row tile fastest."""
-    return max(TILE_ROWS, triton.next_power_of_2(group)), WARPS, STAGES
+def tile_for(columns, group, capability):
+    """(rows, warps, stages) of a window launch's query tile, for `columns` columns over KV heads serving `group` query
+    heads each on a GPU of `capability` (major, minor): the smallest power of two of 16 rows or more holding the
+    columns' query rows, up to 32, in two warps; past 32 rows a 64-row tile in four warps (each piece's keys and values
+    read once for its columns), except on GPUs whose tensor cores take four warps over 64 rows as warpgroup MMA (sm_90's
+    wgmma, sm_100's and sm_110's tcgen05: another summation order), which read such windows in 32-row tiles; past 32
+    heads a group, one column a tile of its power of two rows in two warps. So on each GPU every tile is multiplied with
+    mma.sync, one instruction shape and summation order whatever the tile, and a column's bits are the same alone and
+    in any window (the tests compile each choice for sm_80, sm_90, sm_100, sm_110 and sm_120 and check). Measured on
+    one sm_120 GPU (an RTX 5090): 64 rows in four warps read windows of more than 32 query rows fastest there."""
+    if group > NARROW_ROWS:
+        return triton.next_power_of_2(group), WARPS, STAGES
+    rows = columns * group
+    if rows <= NARROW_ROWS or capability[0] in WARPGROUP_MMA:
+        return max(16, triton.next_power_of_2(min(rows, NARROW_ROWS))), WARPS, STAGES
+    return WIDE_ROWS, WIDE_WARPS, WIDE_STAGES
 
 
 def workspace_floats(tokens, heads, partitions, value_dim):
@@ -211,8 +222,8 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     rows' tokens, and lse [tokens][heads] FP32 (natural log of each row's softmax sum over its scaled scores) when
     given; returns out. workspace: an FP32 tensor of workspace_floats(partial rows, heads, partitions, value_dim) or
     more for the partials (default: one the module keeps per device, grown outside a capture). piece: positions per
-    piece (default piece_size). tile, num_warps, num_stages, maxnreg: another launch configuration than pinned() (a
-    measurement's), whose columns keep their bits only where the GPU multiplies it as mma.sync too."""
+    piece (default piece_size). tile, num_warps, num_stages, maxnreg: another launch configuration than tile_for()'s
+    (a measurement's), whose columns keep their bits only where the GPU multiplies it with mma.sync too."""
     k_kind = _check_kind(kind, key_scales)
     T, hq, d = q.shape
     hkv, dv = key_pages.shape[-2], value_pages.shape[-1]
@@ -241,7 +252,7 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     off_ptr = offsets if offsets is not None else starts
     launch = {"maxnreg": int(maxnreg)} if maxnreg else {}
     piece = int(piece or piece_size(d, dv, kind))
-    bm, warps, stages = pinned(g)
+    bm, warps, stages = tile_for(columns, g, _capability(device)[0])
     if tile:
         bm = max(16, triton.next_power_of_2(max(int(tile), g)))
     warps, stages = num_warps or warps, num_stages or stages
@@ -251,10 +262,10 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     if blocks is None:
         cpt = bm // g
         grid = (triton.cdiv(columns, cpt), parts, R * hkv)
-        _kernels._window_kernel[grid](q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, off_ptr, po, pm,
-                                      pl, q.stride(0), q.stride(1), tables.stride(0), tables.shape[1], parts, scale,
-                                      float(multipliers[0]), float(multipliers[1]), columns, COLS=columns, CPT=cpt,
-                                      BLOCK_M=bm, num_warps=warps, num_stages=stages, **common, **launch)
+        _kernels._window_kernel[grid](q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, off_ptr, po, pm, pl,
+                     q.stride(0), q.stride(1), tables.stride(0), tables.shape[1], parts, scale, float(multipliers[0]),
+                     float(multipliers[1]), columns, COLS=columns, CPT=cpt, BLOCK_M=bm, num_warps=warps,
+                     num_stages=stages, **common, **launch)
         fixed = 0
     else:
         if not block_size or block_size < 1:
@@ -262,7 +273,8 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
         if blocks.stride(-1) != 1:
             blocks = blocks.contiguous()
         k = int(blocks.shape[-1])
-        bm = max(16, triton.next_power_of_2(g))   # one token's query heads a program
+        bm, warps = max(16, triton.next_power_of_2(g)), num_warps or WARPS   # one token's query heads a program
+        stages = num_stages or STAGES
         grid = (parts, hkv, R * columns)
         _kernels._sparse_kernel[grid](q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, off_ptr,
                                       blocks, blocks.stride(0), k, int(block_size), po, pm, pl, q.stride(0),

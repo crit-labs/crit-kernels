@@ -186,11 +186,13 @@ def test_a_count_past_the_columns_reads_as_the_columns():
     assert torch.equal(got, want)    # row 0's partials stay its own (no row writes past its columns)
 
 
-def _lowering(arch, group, d, kind):
-    """The MMA instructions Triton gives the pinned window launch for `arch` (compiled offline, no GPU of that kind
-    needed): from the TTGIR, wgmma (warp_group_dot), tcgen05 (tc_gen5_mma) or mma.sync (nvidia_mma v2)."""
+def _lowering(arch, group, d, kind, columns):
+    """The MMA instructions Triton gives the window launch tile_for() picks for `columns` columns on `arch` (compiled
+    offline, no GPU of that kind needed): from the TTGIR, wgmma (warp_group_dot), tcgen05 (tc_gen5_mma) or mma.sync
+    (nvidia_mma v2)."""
     import triton
     from triton.backends.compiler import GPUTarget
+    rows, warps, stages = pk.tile_for(columns, group, (arch // 10, arch % 10))
     kernel = pk._kernels._window_kernel
     store = {0: "*bf16", 1: "*u8", 2: "*u8", 3: "*i8"}[kind]
     signature = {"q_ptr": "*bf16", "k_ptr": store, "v_ptr": store, "ks_ptr": "*fp32", "vs_ptr": "*fp32",
@@ -198,7 +200,6 @@ def _lowering(arch, group, d, kind):
                  "par_ptr": "*i64", "off_ptr": "*i32", "po_ptr": "*fp32", "pm_ptr": "*fp32", "pl_ptr": "*fp32",
                  "stride_qt": "i32", "stride_qh": "i32", "tab_stride": "i32", "tab_width": "i32", "n_parts": "i32",
                  "sm_scale": "fp32", "k_mult": "fp32", "v_mult": "fp32", "count_all": "i32"}
-    rows, warps, stages = pk.pinned(group)
     constants = {"COLS": 8, "CPT": rows // group, "HQ": group * 2, "HKV": 2, "G": group, "D": d, "DV": d,
                  "BLOCK_M": rows, "PIECE": pk.piece_size(d, d, ["bf16", "fp8", "fp8:row", "int8"][kind]), "PAGE": 16,
                  "KIND": kind, "HW_FP8": arch >= 89, "TREE": False, "COUNTS": True, "OFFSETS": True, "DC": min(64, d)}
@@ -212,12 +213,46 @@ def _lowering(arch, group, d, kind):
                                    ("mma.sync", "versionMajor = 2")) if key in ir}
 
 
-@pytest.mark.parametrize("arch", [80, 90, 100, 120])
-@pytest.mark.parametrize("group,d,kind", [(6, 256, 2), (12, 256, 0), (7, 128, 3), (64, 128, 0)])
-def test_the_pinned_launch_multiplies_with_mma_sync_on_every_gpu(arch, group, d, kind):
-    # Four warps over 64 rows or more lower to wgmma on sm_90 and tcgen05 on sm_100, whose summation order differs
-    # from mma.sync's: the pinned launch keeps one instruction on every GPU, so a column's bits hold there too.
-    assert _lowering(arch, group, d, kind) == {"mma.sync"}
+@pytest.mark.parametrize("arch", [80, 90, 100, 110, 120])
+@pytest.mark.parametrize("group,d,kind,columns", [(6, 256, 2, 1), (6, 256, 2, 5), (6, 256, 2, 8), (12, 256, 0, 1),
+                                                  (12, 256, 0, 5), (7, 128, 3, 5), (64, 128, 0, 1)])
+def test_every_window_tile_multiplies_with_mma_sync_on_every_gpu(arch, group, d, kind, columns):
+    # Four warps over 64 rows lower to wgmma on sm_90 and tcgen05 on sm_100 and sm_110, whose summation order differs
+    # from mma.sync's: there tile_for() keeps windows in 32-row two-warp tiles, elsewhere it takes 64 rows in four
+    # warps, which those GPUs multiply with mma.sync: on each GPU every tile has one instruction, so a column's bits are
+    # the same in any tile.
+    assert _lowering(arch, group, d, kind, columns) == {"mma.sync"}
+
+
+def test_a_wide_window_takes_a_64_row_tile_only_where_it_stays_mma_sync():
+    assert pk.tile_for(5, 12, (12, 0)) == (64, 4, 4)
+    assert pk.tile_for(5, 12, (9, 0)) == (32, 2, 3)
+    assert pk.tile_for(5, 12, (10, 0)) == (32, 2, 3)
+    assert pk.tile_for(1, 6, (12, 0)) == (16, 2, 3)
+    assert pk.tile_for(5, 6, (12, 0)) == (32, 2, 3)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("kind", ["bf16", "fp8:row", "int8", "fp8"])
+@pytest.mark.parametrize("hq,hkv,d", [(24, 2, 256), (24, 4, 256), (56, 8, 128)])
+def test_every_tile_gives_a_column_the_one_column_decodes_bits(kind, hq, hkv, d):
+    # Every tile tile_for() picks (16 or 32 rows in two warps, 64 rows in four on this GPU) gives each column the bits
+    # of the column decoded alone, in windows of every width, trees and log-sum-exps included.
+    cache = Cache(kind, hkv, d, d, 16, [700, 1500])
+    q = _q(16, hq, d, 13)
+    lse = torch.empty(16, hq, device=dev)
+    for cols in (2, 5, 8):
+        window = cache.attend(q, [0, 1], [0, 8], [690, 1490], cols, lse=lse)
+        for r, (s, start, first) in enumerate(zip([0, 1], [0, 8], [690, 1490])):
+            for c in range(cols):
+                one_lse = torch.empty(1, hq, device=dev)
+                one = cache.attend(q[start + c:start + c + 1], [s], [0], [first + c], 1, lse=one_lse)
+                assert torch.equal(one[0], window[start + c]), (cols, r, c)
+                assert torch.equal(one_lse[0], lse[start + c]), (cols, r, c)
+    parents = torch.tensor([-1, 0, 0, 1, 1, 2, 5, 3], dtype=torch.int64, device=dev)
+    tree = cache.attend(q[:8], [0], [0], [690], 8, parents=parents)
+    alone = cache.attend(q[:8], [0], [0], [690], 8, parents=parents, tile=16, num_warps=2, num_stages=3)
+    assert torch.equal(tree, alone)
 
 
 @pytest.mark.kernels_ci
