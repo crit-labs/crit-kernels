@@ -1,94 +1,158 @@
-// Torch entry points over grouped_experts.h: shape checks, the current stream. The expert table is a uint8 CUDA tensor
-// holding one Matrix (codes pointer, scales pointer, post) per expert, as the Python layer packs it.
+// Torch entry points over grouped_experts.h: shape and dtype checks, the current stream. A layout is an int list
+// [format, bytes, gate_up, gate_up_scale, gate_up_inverse, down, down_scale, down_inverse, input, hidden, inter] (byte
+// offsets, -1 for a component the format lacks), as crit's grouped-experts plugin computes it.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
 
+#include <optional>
+
 #include "grouped_experts.h"
 
-namespace gx = crit::techniques::streamed_prefill;
+namespace gx = crit::techniques::grouped_experts;
 
 namespace {
-void check_ok(cudaError_t e, const char* what) { TORCH_CHECK(e == cudaSuccess, what, ": ", cudaGetErrorString(e)); }
-void check_cuda(const torch::Tensor& t, const char* name, torch::ScalarType type) {
+void ok(cudaError_t e, const char* what) { TORCH_CHECK(e == cudaSuccess, what, ": ", cudaGetErrorString(e)); }
+void cuda(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda() && t.is_contiguous(), name, " must be a contiguous CUDA tensor");
-    TORCH_CHECK(t.scalar_type() == type, name, " has the wrong dtype");
 }
-gx::Routing routing(const torch::Tensor& ids, const torch::Tensor& weights, int64_t experts) {
-    check_cuda(ids, "ids", torch::kInt32);
-    TORCH_CHECK(ids.dim() == 2, "ids must be [tokens, top_k]");
-    gx::Routing r;
-    r.ids = ids.data_ptr<std::int32_t>();
-    r.tokens = static_cast<int>(ids.size(0));
-    r.top_k = static_cast<int>(ids.size(1));
-    r.experts = static_cast<int>(experts);
-    if(weights.defined() && weights.numel()) {
-        check_cuda(weights, "weights", torch::kFloat32);
-        TORCH_CHECK(weights.sizes() == ids.sizes(), "weights must be [tokens, top_k]");
-        r.weights = weights.data_ptr<float>();
-    }
-    return r;
+void typed(const torch::Tensor& t, const char* name, torch::ScalarType type) {
+    cuda(t, name);
+    TORCH_CHECK(t.scalar_type() == type, name, " has dtype ", t.scalar_type(), ", not ", type);
 }
-gx::Workspace workspace(const torch::Tensor& counts, const torch::Tensor& offsets, const torch::Tensor& tile_offsets,
-                        const torch::Tensor& row_route, const torch::Tensor& route_row) {
-    for(const auto* t : {&counts, &offsets, &tile_offsets, &row_route, &route_row}) check_cuda(*t, "workspace", torch::kInt32);
-    return {counts.data_ptr<int>(), offsets.data_ptr<int>(), tile_offsets.data_ptr<int>(), row_route.data_ptr<int>(),
-            route_row.data_ptr<int>()};
+gx::Layout layout_of(c10::ArrayRef<int64_t> v) {
+    TORCH_CHECK(v.size() == 11, "a layout is 11 integers");
+    gx::Layout L;
+    L.format = static_cast<gx::Format>(v[0]);
+    L.bytes = v[1];
+    L.gate_up = v[2], L.gate_up_scale = v[3], L.gate_up_inverse = v[4];
+    L.down = v[5], L.down_scale = v[6], L.down_inverse = v[7], L.input = v[8];
+    L.hidden = static_cast<int>(v[9]), L.inter = static_cast<int>(v[10]);
+    TORCH_CHECK(v[0] >= 0 && v[0] <= 5, "unknown format ", v[0]);
+    return L;
+}
+gx::Items items_of(const torch::Tensor& slot, const torch::Tensor& routes, const torch::Tensor& count) {
+    typed(slot, "item_slot", torch::kInt32);
+    typed(routes, "item_routes", torch::kInt32);
+    typed(count, "item_count", torch::kInt32);
+    TORCH_CHECK(routes.dim() == 2 && routes.size(0) == slot.size(0), "item_routes is [capacity][width]");
+    gx::Items it;
+    it.slot = slot.data_ptr<int>();
+    it.routes = routes.data_ptr<int>();
+    it.count = count.data_ptr<int>();
+    it.width = static_cast<int>(routes.size(1));
+    it.capacity = static_cast<int>(slot.size(0));
+    return it;
+}
+const int* slots_of(const std::optional<torch::Tensor>& slots, int64_t experts) {
+    if(!slots || !slots->defined() || slots->numel() == 0) return nullptr;
+    typed(*slots, "slots", torch::kInt32);
+    TORCH_CHECK(slots->numel() >= experts, "slots has one entry per expert");
+    return slots->data_ptr<int>();
+}
+void ids_of(const torch::Tensor& ids, const long long*& ids64, const int*& ids32) {
+    cuda(ids, "ids");
+    ids64 = nullptr;
+    ids32 = nullptr;
+    if(ids.scalar_type() == torch::kInt64) ids64 = reinterpret_cast<const long long*>(ids.data_ptr<int64_t>());
+    else if(ids.scalar_type() == torch::kInt32) ids32 = ids.data_ptr<int>();
+    else TORCH_CHECK(false, "ids are int64 or int32");
+}
+void store_of(const torch::Tensor& store, const gx::Layout& L) {
+    typed(store, "store", torch::kUInt8);
+    TORCH_CHECK(store.dim() == 2 && store.size(1) == L.bytes, "store is [slots][bundle bytes]");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(store.data_ptr()) % 16 == 0, "store must be 16-byte aligned");
 }
 }  // namespace
 
-void route_sort(const torch::Tensor& ids, int64_t experts, torch::Tensor& counts, torch::Tensor& offsets,
-                torch::Tensor& tile_offsets, torch::Tensor& row_route, torch::Tensor& route_row) {
+void plan(const torch::Tensor& ids, const std::optional<torch::Tensor>& slots, int64_t experts, torch::Tensor& item_slot,
+          torch::Tensor& item_routes, torch::Tensor& item_count) {
     const c10::cuda::CUDAGuard guard(ids.device());
-    check_ok(gx::enqueue_route_sort(routing(ids, torch::Tensor(), experts), workspace(counts, offsets, tile_offsets, row_route, route_row),
-                                    at::cuda::getCurrentCUDAStream()), "route_sort");
+    const long long* ids64;
+    const int* ids32;
+    ids_of(ids, ids64, ids32);
+    ok(gx::enqueue_plan(ids64, ids32, static_cast<int>(ids.numel()), static_cast<int>(experts), slots_of(slots, experts),
+                        items_of(item_slot, item_routes, item_count), at::cuda::getCurrentCUDAStream()),
+       "plan");
 }
 
-void gather(const torch::Tensor& x, const torch::Tensor& ids, int64_t experts, const torch::Tensor& counts,
-            const torch::Tensor& offsets, const torch::Tensor& tile_offsets, const torch::Tensor& row_route,
-            const torch::Tensor& route_row, torch::Tensor& xp) {
+void items(const torch::Tensor& order, const torch::Tensor& counts, const torch::Tensor& starts,
+           const torch::Tensor& item_end, const std::optional<torch::Tensor>& slots, int64_t experts,
+           torch::Tensor& item_slot, torch::Tensor& item_routes, torch::Tensor& item_count) {
+    const c10::cuda::CUDAGuard guard(order.device());
+    typed(order, "order", torch::kInt64);
+    typed(counts, "counts", torch::kInt32);
+    typed(starts, "starts", torch::kInt32);
+    typed(item_end, "item_end", torch::kInt32);
+    TORCH_CHECK(counts.numel() >= experts && starts.numel() >= experts && item_end.numel() >= experts,
+                "counts, starts and item_end have one entry per expert");
+    ok(gx::enqueue_items(reinterpret_cast<const long long*>(order.data_ptr<int64_t>()), counts.data_ptr<int>(),
+                         starts.data_ptr<int>(), item_end.data_ptr<int>(), static_cast<int>(experts),
+                         slots_of(slots, experts), items_of(item_slot, item_routes, item_count),
+                         at::cuda::getCurrentCUDAStream()),
+       "items");
+}
+
+void gate_up(const torch::Tensor& x, int64_t top, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+             bool a4, const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+             torch::Tensor& h) {
     const c10::cuda::CUDAGuard guard(x.device());
-    check_cuda(x, "x", torch::kFloat16);
-    check_cuda(xp, "xp", torch::kFloat16);
-    check_ok(gx::enqueue_gather(reinterpret_cast<const __half*>(x.data_ptr()), static_cast<int>(x.size(1)),
-                                routing(ids, torch::Tensor(), experts), workspace(counts, offsets, tile_offsets, row_route, route_row),
-                                reinterpret_cast<__half*>(xp.data_ptr()), at::cuda::getCurrentCUDAStream()), "gather");
+    const gx::Layout L = layout_of(layout);
+    typed(x, "x", torch::kBFloat16);
+    typed(h, "h", torch::kBFloat16);
+    store_of(store, L);
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == L.hidden, "x is [tokens][hidden]");
+    TORCH_CHECK(h.dim() == 2 && h.size(1) == L.inter && h.size(0) >= x.size(0) * top, "h is [routes][inter]");
+    ok(gx::enqueue_gate_up(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), static_cast<int>(top), store.data_ptr<uint8_t>(),
+                           L, a4, items_of(item_slot, item_routes, item_count), reinterpret_cast<__nv_bfloat16*>(h.data_ptr()),
+                           at::cuda::getCurrentCUDAStream()),
+       "gate_up");
 }
 
-void grouped_projection(int64_t format, const torch::Tensor& table, const torch::Tensor& xp, int64_t out_dim,
-                        const torch::Tensor& ids, int64_t experts, const torch::Tensor& counts, const torch::Tensor& offsets,
-                        const torch::Tensor& tile_offsets, const torch::Tensor& row_route, const torch::Tensor& route_row,
-                        torch::Tensor& yp) {
-    const c10::cuda::CUDAGuard guard(xp.device());
-    check_cuda(table, "table", torch::kUInt8);
-    TORCH_CHECK(table.numel() == experts * static_cast<int64_t>(sizeof(gx::Matrix)), "table must hold one Matrix per expert");
-    check_cuda(xp, "xp", torch::kFloat16);
-    check_cuda(yp, "yp", torch::kFloat16);
-    check_ok(gx::enqueue_grouped_projection(static_cast<gx::Format>(format), reinterpret_cast<const gx::Matrix*>(table.data_ptr()),
-                                            reinterpret_cast<const __half*>(xp.data_ptr()), static_cast<int>(xp.size(1)),
-                                            static_cast<int>(out_dim), routing(ids, torch::Tensor(), experts),
-                                            workspace(counts, offsets, tile_offsets, row_route, route_row),
-                                            reinterpret_cast<__half*>(yp.data_ptr()), at::cuda::getCurrentCUDAStream()),
-             "grouped_projection");
+void down(const torch::Tensor& h, const torch::Tensor& store, c10::ArrayRef<int64_t> layout, bool a4,
+          const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+          torch::Tensor& y) {
+    const c10::cuda::CUDAGuard guard(h.device());
+    const gx::Layout L = layout_of(layout);
+    typed(h, "h", torch::kBFloat16);
+    typed(y, "y", torch::kFloat32);
+    store_of(store, L);
+    TORCH_CHECK(h.dim() == 2 && h.size(1) == L.inter, "h is [routes][inter]");
+    TORCH_CHECK(y.dim() == 2 && y.size(1) == L.hidden && y.size(0) >= h.size(0), "y is [routes][hidden]");
+    ok(gx::enqueue_down(reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()), store.data_ptr<uint8_t>(), L, a4,
+                        items_of(item_slot, item_routes, item_count), y.data_ptr<float>(), at::cuda::getCurrentCUDAStream()),
+       "down");
 }
 
-void swiglu(const torch::Tensor& gate_up, torch::Tensor& out) {
-    const c10::cuda::CUDAGuard guard(gate_up.device());
-    check_cuda(gate_up, "gate_up", torch::kFloat16);
-    check_cuda(out, "out", torch::kFloat16);
-    TORCH_CHECK(gate_up.size(1) == 2 * out.size(1) && gate_up.size(0) == out.size(0), "gate_up must be [rows, 2 * inter]");
-    check_ok(gx::enqueue_swiglu(reinterpret_cast<const __half*>(gate_up.data_ptr()), static_cast<int>(out.size(1)),
-                                static_cast<int>(out.size(0)), reinterpret_cast<__half*>(out.data_ptr()),
-                                at::cuda::getCurrentCUDAStream()), "swiglu");
+void combine(const torch::Tensor& y, const torch::Tensor& ids, const torch::Tensor& weights,
+             const std::optional<torch::Tensor>& slots, int64_t experts, bool skip_negative, torch::Tensor& out) {
+    const c10::cuda::CUDAGuard guard(y.device());
+    typed(y, "y", torch::kFloat32);
+    typed(weights, "weights", torch::kFloat32);
+    typed(out, "out", torch::kFloat32);
+    const long long* ids64;
+    const int* ids32;
+    ids_of(ids, ids64, ids32);
+    TORCH_CHECK(ids.dim() == 2 && weights.sizes() == ids.sizes(), "ids and weights are [tokens][top]");
+    const int64_t tokens = ids.size(0), top = ids.size(1), hidden = out.size(1);
+    TORCH_CHECK(out.dim() == 2 && out.size(0) == tokens && y.size(0) >= tokens * top && y.size(1) == hidden,
+                "y is [routes][hidden] and out [tokens][hidden]");
+    ok(gx::enqueue_combine(y.data_ptr<float>(), ids64, ids32, weights.data_ptr<float>(), slots_of(slots, experts),
+                           static_cast<int>(experts), static_cast<int>(tokens), static_cast<int>(top),
+                           static_cast<int>(hidden), skip_negative, out.data_ptr<float>(), at::cuda::getCurrentCUDAStream()),
+       "combine");
 }
 
-void combine(const torch::Tensor& yp, const torch::Tensor& ids, const torch::Tensor& weights, int64_t experts,
-             const torch::Tensor& counts, const torch::Tensor& offsets, const torch::Tensor& tile_offsets,
-             const torch::Tensor& row_route, const torch::Tensor& route_row, torch::Tensor& out) {
-    const c10::cuda::CUDAGuard guard(yp.device());
-    check_cuda(yp, "yp", torch::kFloat16);
-    check_cuda(out, "out", torch::kFloat32);
-    check_ok(gx::enqueue_combine(reinterpret_cast<const __half*>(yp.data_ptr()), static_cast<int>(out.size(1)),
-                                 routing(ids, weights, experts), workspace(counts, offsets, tile_offsets, row_route, route_row),
-                                 out.data_ptr<float>(), at::cuda::getCurrentCUDAStream()), "combine");
+void quantize_e2m1x2(const torch::Tensor& x, double global, torch::Tensor& values, torch::Tensor& scales) {
+    const c10::cuda::CUDAGuard guard(x.device());
+    typed(x, "x", torch::kFloat32);
+    typed(values, "values", torch::kInt8);
+    typed(scales, "scales", torch::kFloat32);
+    TORCH_CHECK(x.dim() == 2 && values.sizes() == x.sizes() && scales.size(0) == x.size(0) &&
+                    scales.size(1) * 16 == x.size(1),
+                "x [rows][cols], values the same, scales [rows][cols / 16]");
+    ok(gx::enqueue_quantize_e2m1x2(x.data_ptr<float>(), static_cast<int>(x.size(0)), static_cast<int>(x.size(1)),
+                                   static_cast<float>(global), values.data_ptr<int8_t>(), scales.data_ptr<float>(),
+                                   at::cuda::getCurrentCUDAStream()),
+       "quantize_e2m1x2");
 }
