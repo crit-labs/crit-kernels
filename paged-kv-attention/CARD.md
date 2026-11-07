@@ -12,7 +12,7 @@ KV pool and its attention plugins):
   (`int8`, scale = max |x| / 127, codes rounded to nearest, ties to even). Slots below 0 are skipped. The codes and
   scales equal torch's encoding of the same rule bit for bit (IEEE divisions).
 - **`attend`**: decode tokens and speculative-verify windows (up to 64 columns a row, causal inside the window) over the
-  pages through per-row page tables, split over KV partitions: piece `i` of 64 positions goes to partition `i mod P`,
+  pages through per-row page tables, split over KV partitions: piece `i` of 32 positions goes to partition `i mod P`,
   each partition walks only up to its row's last position (read on the device), and the partials merge in partition
   order by their log-sum-exps. The work follows each row's length, not the cache's capacity, and one CUDA graph replays
   at every length. Tree masks (`parents`: a draft tree's columns see their ancestors and themselves), block-sparse

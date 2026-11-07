@@ -303,3 +303,36 @@ def test_prompt_chunks_match_float64_attention(kind):
         approx = pk.prefill(q.to(q_dtype), cache.k, cache.v, kind, table, 200, 16, key_scales=cache.ks,
                             value_scales=cache.vs, int8_qk=True)
         assert float((approx.float() - out.float()).abs().max()) < 0.06
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("kind", ["bf16", "fp8:row", "int8"])
+def test_key_only_writes_leave_no_values(kind):
+    g = torch.Generator().manual_seed(3)
+    keys = torch.randn(20, 1, 64, generator=g).to(dev)
+    k = torch.zeros(32, 1, 64, dtype=STORE[kind], device=dev)
+    ks = torch.zeros(32, 1, device=dev) if kind != "bf16" else None
+    slots = torch.arange(20, device=dev) + 5
+    pk.write(keys, None, slots, k, None, kind, ks, None)
+    both = torch.zeros_like(k)
+    other = torch.zeros(32, 1, 64, dtype=STORE[kind], device=dev)
+    both_s = torch.zeros(32, 1, device=dev) if ks is not None else None
+    pk.write(keys, keys, slots, both, other, kind, both_s, torch.zeros_like(both_s) if ks is not None else None)
+    view = (lambda t: t.view(torch.uint8)) if kind == "fp8:row" else (lambda t: t)
+    assert torch.equal(view(k), view(both))
+    if ks is not None:
+        assert torch.equal(ks, both_s)
+
+
+@pytest.mark.kernels_ci
+def test_a_given_workspace_holds_the_partials_and_a_small_one_is_refused():
+    cache = Cache("bf16", 2, 128, 128, 16, [300])
+    q = _q(4, 8, 128, 9)
+    floats = pk.workspace_floats(1, 4, 8, 16, 128)
+    own = cache.attend(q, [0], [0], [296], 4, partitions=16)
+    given = cache.attend(q, [0], [0], [296], 4, partitions=16,
+                         workspace=torch.empty(floats, dtype=torch.float32, device=dev))
+    assert torch.equal(own, given)
+    with pytest.raises(ValueError, match="workspace"):
+        cache.attend(q, [0], [0], [296], 4, partitions=16,
+                     workspace=torch.empty(floats - 1, dtype=torch.float32, device=dev))

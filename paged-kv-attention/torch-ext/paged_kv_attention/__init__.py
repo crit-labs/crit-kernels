@@ -42,10 +42,11 @@ import triton
 
 from . import _kernels
 
-__all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "attend", "partitions", "prefill", "workspace_floats", "write"]
+__all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "attend", "partitions", "piece_size", "prefill", "workspace_floats",
+           "write"]
 
 KINDS = {"bf16": 0, "fp16": 0, "fp8": 1, "fp8:row": 2, "int8": 3}
-PIECE = 64          # positions per piece: the unit of a partition's walk
+PIECE = 32          # positions per piece of FP8 or INT8 pages at a 256-wide head (piece_size)
 MAX_COLUMNS = 64    # columns of one row a launch reads (a tree's ancestor masks are 64-bit)
 
 _workspaces = {}
@@ -87,10 +88,19 @@ def _dummy(device):
 
 
 def partitions(device, kv_heads):
-    """A default partition count for a cache of `kv_heads` heads on `device`: about two programs per SM for one row,
-    within 8..64. A column's bits depend on it, so keep one count for every launch whose results must agree."""
+    """A default partition count for a cache of `kv_heads` heads on `device`: about one and a half programs per SM
+    for one row (a power of two within 8..128; measured best at 256-wide heads with 4 KV heads and 128-wide with 8 on
+    an sm_120 GPU). A column's bits depend on it, so keep one count for every launch whose results must agree."""
     sms = _capability(torch.device(device))[1]
-    return max(8, min(64, math.ceil(2 * sms / max(1, kv_heads))))
+    return max(8, min(128, triton.next_power_of_2(max(1, (3 * sms) // (2 * max(1, kv_heads))))))
+
+
+def piece_size(head_dim, value_dim, kind="bf16"):
+    """Positions per piece for heads of these widths and a page kind: 16,384 head values for 16-bit pages, 8,192 for
+    codes converted in registers (FP8, INT8), within 16..128 (measured best at 256- and 128-wide heads on an sm_120
+    GPU). A column's bits depend on it; it follows the cache's geometry and page kind only."""
+    values = 16384 if KINDS[kind] == 0 else 8192
+    return max(16, min(128, values // max(head_dim, value_dim)))
 
 
 def write(keys, values, slots, key_pages, value_pages, kind, key_scales=None, value_scales=None,
@@ -142,6 +152,14 @@ def workspace_floats(rows, columns, heads, partitions, value_dim):
     return rows * columns * heads * partitions * (value_dim + 2)
 
 
+def _launch(rows, num_warps, num_stages):
+    """Warps and pipeline stages of a query tile of `rows` rows: a warp per 16 rows, two at least (two warps with three
+    stages read a one-column tile fastest, four with four a 64-row one, measured at a 256-wide head on an sm_120 GPU).
+    Neither changes a column's bits (every per-row sum runs on the tensor cores in a fixed order)."""
+    warps = num_warps or max(2, rows // 16)
+    return warps, num_stages or (3 if warps <= 2 else 4)
+
+
 def _workspace(device, rows, columns, heads, parts, dv, given=None):
     """Partials for rows x columns x heads x parts: outputs, maxima and sums, in `given` (one FP32 tensor of
     workspace_floats or more) or in a module workspace that grows outside a capture only."""
@@ -172,8 +190,8 @@ def _workspace(device, rows, columns, heads, parts, dv, given=None):
 
 def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, columns, page, *, counts=None,
            key_scales=None, value_scales=None, multipliers=(1.0, 1.0), scale=None, partitions=None, parents=None,
-           blocks=None, block_size=None, out=None, lse=None, tile=None, workspace=None, piece=PIECE, num_warps=4,
-           num_stages=2):
+           blocks=None, block_size=None, out=None, lse=None, tile=None, workspace=None, piece=None, num_warps=None,
+           num_stages=None, maxnreg=None):
     """Decode and verify windows over paged KV (see the module's description).
 
     q [tokens][heads][dim] BF16 or FP16 (FP16 for "fp16" pages); key_pages/value_pages one layer's pages, key_scales/
@@ -208,15 +226,18 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     po, pm, pl = _workspace(device, R, columns, hq, parts, dv, workspace)
     if max(d, dv) > 4 * min(64, d, dv):
         raise ValueError("head dims are powers of two of 16 to 256 (keys and values within four 64-wide chunks)")
+    launch = {"maxnreg": int(maxnreg)} if maxnreg else {}
+    piece = int(piece or piece_size(d, dv, kind))
     common = dict(HQ=hq, HKV=hkv, G=g, D=d, DV=dv, PIECE=piece, PAGE=page, KIND=k_kind,
                   HW_FP8=_hardware_fp8(device), TREE=tree, COUNTS=counts is not None, DC=min(64, d, dv))
     if blocks is None:
         bm, cpt = _tile(columns, g, max(d, dv), tile)
+        warps, stages = _launch(bm, num_warps, num_stages)
         grid = (triton.cdiv(columns, cpt), parts, R * hkv)
         _kernels._window_kernel[grid](q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, po, pm, pl,
                                       q.stride(0), q.stride(1), tables.stride(0), tables.shape[1], parts, scale,
                                       float(multipliers[0]), float(multipliers[1]), columns, COLS=columns, CPT=cpt,
-                                      BLOCK_M=bm, num_warps=num_warps, num_stages=num_stages, **common)
+                                      BLOCK_M=bm, num_warps=warps, num_stages=stages, **common, **launch)
         fixed = 0
     else:
         if not block_size or block_size < 1:
@@ -225,12 +246,13 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
             blocks = blocks.contiguous()
         k = int(blocks.shape[-1])
         bm = max(16, triton.next_power_of_2(g))
+        warps, stages = _launch(bm, num_warps, num_stages)
         grid = (parts, hkv, R * columns)
         _kernels._sparse_kernel[grid](q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, blocks,
                                       blocks.stride(0), k, int(block_size), po, pm, pl, q.stride(0), q.stride(1),
                                       tables.stride(0), tables.shape[1], parts, scale, float(multipliers[0]),
-                                      float(multipliers[1]), columns, COLS=columns, BLOCK_M=bm, num_warps=num_warps,
-                                      num_stages=num_stages, **common)
+                                      float(multipliers[1]), columns, COLS=columns, BLOCK_M=bm, num_warps=warps,
+                                      num_stages=stages, **common)
         fixed = triton.cdiv(k * int(block_size), piece)
     block_p = triton.next_power_of_2(parts)
     _kernels._merge_kernel[(columns, hq, R)](po, pm, pl, out, lse if lse is not None else pm, starts, count_ptr,
