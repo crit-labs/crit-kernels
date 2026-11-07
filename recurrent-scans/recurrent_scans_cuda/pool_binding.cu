@@ -68,11 +68,13 @@ rk::PoolDelta pool_of(const rk::DeltaShape& d, torch::Tensor& states, torch::Ten
     check_contiguous(stash, "stash", torch::kFloat32, 3);
     check_contiguous(control, "control", torch::kInt32, 3);
     TORCH_CHECK(capacity >= 1, "the stash holds one column or more");
-    TORCH_CHECK(stash.size(0) == states.size(0) && stash.size(1) == states.size(1) &&
+    // Every tensor has the layers; the sequence counts may differ (a pool keeps a spare sequence in some of them):
+    // every row's sequence index, read on the device, must lie in each.
+    TORCH_CHECK(stash.size(0) == states.size(0) &&
                 stash.size(2) == 2 * static_cast<int64_t>(rk::pool_delta_half_floats(d, static_cast<int>(capacity))),
                 "stash must be [layers][sequences][2 * pool_delta_half_floats]");
-    TORCH_CHECK(control.size(0) == states.size(0) && control.size(1) == states.size(1) &&
-                control.size(2) == 2 * rk::pool_delta_blocks(d), "control must be [layers][sequences][2 * pool_delta_blocks]");
+    TORCH_CHECK(control.size(0) == states.size(0) && control.size(2) == 2 * rk::pool_delta_blocks(d),
+                "control must be [layers][sequences][2 * pool_delta_blocks]");
     rk::PoolDelta p;
     p.states = states.data_ptr<float>();
     p.state_sequence = states.stride(1);
@@ -235,10 +237,10 @@ void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, 
     check_contiguous(stash, "stash", torch::kFloat32, 4);
     check_contiguous(pending, "pending", torch::kInt32, 3);
     TORCH_CHECK(window.size(2) == c.channels && window.size(3) == c.width - 1, "window must be [layers][sequences][channels][width - 1]");
-    TORCH_CHECK(stash.size(0) == window.size(0) && stash.size(1) == window.size(1) && stash.size(2) == capacity &&
-                stash.size(3) == c.channels, "stash must be [layers][sequences][capacity][channels]");
-    TORCH_CHECK(pending.size(0) == window.size(0) && pending.size(1) == window.size(1) &&
-                pending.size(2) == rk::pool_conv_blocks(c.channels), "pending must be [layers][sequences][pool_conv_blocks]");
+    TORCH_CHECK(stash.size(0) == window.size(0) && stash.size(2) == capacity && stash.size(3) == c.channels,
+                "stash must be [layers][sequences][capacity][channels]");
+    TORCH_CHECK(pending.size(0) == window.size(0) && pending.size(2) == rk::pool_conv_blocks(c.channels),
+                "pending must be [layers][sequences][pool_conv_blocks]");
     TORCH_CHECK(layer >= 0 && layers >= 1 && layer + layers <= window.size(0), "layers out of range");
     rk::PoolConv p;
     p.window = window.data_ptr<float>() + layer * window.stride(0);
