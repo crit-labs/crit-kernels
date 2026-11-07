@@ -374,15 +374,22 @@ def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr
 
 # -- prompt chunks ----------------------------------------------------------------------------------------------------
 @triton.jit
-def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_ptr, pos_ptr, T, pos0, sm_scale, k_mult,
-                    v_mult, stride_qt, stride_qh, stride_ot, stride_oh, HQ: tl.constexpr, HKV: tl.constexpr,
-                    G: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, PAGE: tl.constexpr,
-                    KIND: tl.constexpr, HW_FP8: tl.constexpr, INT8_QK: tl.constexpr, LSE: tl.constexpr,
-                    POS_T: tl.constexpr):
+def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_ptr, pos_ptr, fk_ptr, fv_ptr, first_ptr,
+                    T, pos0, first0, sm_scale, k_mult, v_mult, stride_qt, stride_qh, stride_ot, stride_oh, stride_fk,
+                    stride_fv,
+                    HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr,
+                    BLOCK_N: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
+                    INT8_QK: tl.constexpr, LSE: tl.constexpr, POS_T: tl.constexpr, FRESH: tl.constexpr,
+                    FIRST_T: tl.constexpr):
     """Program (query block, query head): a chunk of one sequence's queries at positions pos0.. over its positions
-    [0, own], causal, through its page table; with POS_T pos0 is read from pos_ptr on the device."""
+    [0, own], causal: through its page table, or with FRESH the positions before `first` through it and the chunk's
+    own from `first` on from its fresh keys and values (fk_ptr, fv_ptr: [T][HKV][D] in the queries' dtype, as the
+    projections gave them; first: first0, or with FIRST_T read from first_ptr on the device, at least pos0); with POS_T
+    pos0 is read from pos_ptr on the device."""
     if POS_T:
         pos0 = tl.load(pos_ptr).to(tl.int32)
+    if FIRST_T:
+        first0 = tl.load(first_ptr).to(tl.int32)
     mb = tl.program_id(0)
     head = tl.program_id(1)
     kvh = head // G
@@ -402,9 +409,10 @@ def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_p
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
     end = tl.minimum(pos0 + (mb + 1) * BLOCK_M, pos0 + T)
-    for n0 in range(0, end, BLOCK_N):
+    paged = tl.minimum(tl.maximum(first0, pos0), end) if FRESH else end      # the positions read from the pages
+    for n0 in range(0, paged, BLOCK_N):
         n = n0 + tl.arange(0, BLOCK_N)
-        nm = n < end
+        nm = n < paged
         pg = tl.load(tab_ptr + n // PAGE, mask=nm, other=0)
         slot = pg.to(tl.int64) * PAGE + n % PAGE
         kc = tl.load(k_ptr + (slot * HKV + kvh)[:, None] * D + d[None, :], mask=nm[:, None], other=0)
@@ -430,6 +438,23 @@ def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_p
             pv = (p * v_mult).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(pv, _values(vc, KIND, HW_FP8, q.dtype))
         m_i = m_new
+    if FRESH:
+        # The chunk's own positions from `first` on from its fresh 16-bit keys and values, no page scales.
+        for n0 in range(paged, end, BLOCK_N):
+            n = n0 + tl.arange(0, BLOCK_N)
+            nm = n < end
+            t = (n - pos0).to(tl.int64)
+            kc = tl.load(fk_ptr + t[:, None] * stride_fk + kvh * D + d[None, :], mask=nm[:, None], other=0.0)
+            s = tl.dot(q, tl.trans(kc.to(q.dtype))) * sm_scale
+            s = tl.where((n[None, :] <= qpos[:, None]) & nm[None, :], s, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(s, axis=1))
+            m_sub = tl.where(m_new == float("-inf"), 0.0, m_new)
+            p = tl.exp(s - m_sub[:, None])
+            alpha = tl.exp(m_i - m_sub)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            vc = tl.load(fv_ptr + t[:, None] * stride_fv + kvh * D + d[None, :], mask=nm[:, None], other=0.0)
+            acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), vc.to(q.dtype))
+            m_i = m_new
     o = acc / l_i[:, None]
     tl.store(out_ptr + rows[:, None] * stride_ot + head * stride_oh + d[None, :], o.to(out_ptr.dtype.element_ty),
              mask=rmask[:, None])

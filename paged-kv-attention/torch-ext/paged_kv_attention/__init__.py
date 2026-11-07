@@ -292,11 +292,15 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
 
 
 def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scales=None, value_scales=None,
-            multipliers=(1.0, 1.0), scale=None, out=None, lse=None, int8_qk=False):
+            multipliers=(1.0, 1.0), scale=None, out=None, lse=None, int8_qk=False, fresh=None):
     """A prompt chunk of one sequence: q [T][heads][dim] at positions position.. (their keys and values written),
     table [pages] int32 -> out [T][heads][dim] in q's dtype (and lse [T][heads] FP32 when given), causal. position: an
     int, or a one-element int64 device tensor read on the device (one launch for every position: a captured graph of
-    the chunk replays at any; its keys reach position + T)."""
+    the chunk replays at any; its keys reach position + T). fresh: (keys, values) [T][kv_heads][dim] in q's dtype, the
+    chunk's own as the projections gave them, or (keys, values, first): the chunk then reads its own positions from
+    `first` on (default: all of them; an int or a one-element int64 device tensor, position + T or more: none) from
+    them, not from the pages (where they were stored at the page kind's precision), and the earlier positions from
+    the pages."""
     k_kind = _check_kind(kind, key_scales)
     if int8_qk and k_kind != 3:
         raise ValueError("int8_qk multiplies INT8 queries with INT8 keys: int8 pages only")
@@ -311,11 +315,22 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
     vs = value_scales if value_scales is not None else ks
     block_n = 64 if d <= 128 else 32
     on_device = torch.is_tensor(position)
+    first = 0
+    if fresh is not None:
+        fk, fv = fresh[:2]
+        first = fresh[2] if len(fresh) > 2 else position
+        if fk.shape != (T, hkv, d) or fv.shape != (T, hkv, d) or fk.stride(-1) != 1 or fv.stride(-1) != 1 or \
+                fk.stride(1) != d or fv.stride(1) != d:
+            raise ValueError(f"fresh keys and values are [{T}][{hkv}][{d}], each head row contiguous")
+    else:
+        fk = fv = q
+    first_t = torch.is_tensor(first)
     _kernels._prefill_kernel[(triton.cdiv(T, 64), hq)](
-        q, kp, vp, ks, vs, table, out, lse if lse is not None else ks, position if on_device else table, T,
-        0 if on_device else int(position),
+        q, kp, vp, ks, vs, table, out, lse if lse is not None else ks, position if on_device else table, fk, fv,
+        first if first_t else table, T, 0 if on_device else int(position), 0 if first_t else int(first),
         float(scale if scale is not None else d ** -0.5), float(multipliers[0]), float(multipliers[1]), q.stride(0),
-        q.stride(1), out.stride(0), out.stride(1), HQ=hq, HKV=hkv, G=hq // hkv, D=d, BLOCK_M=64, BLOCK_N=block_n,
-        PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device), INT8_QK=int8_qk, LSE=lse is not None,
-        POS_T=on_device, num_warps=4, num_stages=3 if int8_qk else 2)
+        q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), HQ=hq, HKV=hkv, G=hq // hkv, D=d,
+        BLOCK_M=64, BLOCK_N=block_n, PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device), INT8_QK=int8_qk,
+        LSE=lse is not None, POS_T=on_device, FRESH=fresh is not None, FIRST_T=first_t, num_warps=4,
+        num_stages=3 if int8_qk else 2)
     return out

@@ -20,19 +20,23 @@ KV pool and its attention plugins):
   blocks), log-sum-exp outputs (`lse`), and partials packed by the rows' tokens (`offsets`), so a launch's workspace
   follows its tokens.
 - **`prefill`**: a causal prompt chunk of one sequence over its pages (any page kind; `int8_qk` multiplies INT8 queries
-  with INT8 keys on integer tensor cores).
+  with INT8 keys on integer tensor cores); its position an int or a device tensor (one CUDA graph for every position);
+  with `fresh` the chunk's own keys and values as the projections gave them (16-bit), the earlier positions from the
+  pages at their kind's precision (over FP8 and INT8 pages the chunk then does not see its own quantization); a first
+  fresh position (an int or a device tensor) reads the chunk's positions before it from the pages too.
 
 Numerics: codes convert exactly to BF16 (FP16 for FP16 pages); scores and the softmax in FP32 with BF16 probabilities
 on the tensor cores. A window launch's query tile (`tile_for`) holds its columns of a KV head's query heads: 16 or 32
 rows in two warps, and past 32 rows 64 rows in four warps where the GPU multiplies that with mma.sync too (sm_80 to
 sm_89, sm_120); on sm_90 (wgmma), sm_100 and sm_110 (tcgen05) such windows take 32-row two-warp tiles. So on each GPU
 every tile is multiplied with mma.sync (the tests compile each GPU's own choice for sm_80, sm_90, sm_100, sm_110 and
-sm_120 and check), and the row sums run on the tensor cores in a fixed order too. A column's result depends only on its own keys and query, the partition count, the piece size and
-the page kind: not on the rows beside it, not on how many columns or rows its launch reads (a token decoded alone
-equals the same token inside a verify window, bit for bit). A launch given another tile or warp count keeps that only
-where the GPU multiplies it with mma.sync as well. Errors against float64 attention over the stored values: within
-8e-3 absolute (BF16 queries and probabilities), log-sum-exps within 1e-3. E4M3 codes convert with the hardware
-conversion from sm_89 and with integer arithmetic before (the same bits).
+sm_120 and check), and the row sums run on the tensor cores in a fixed order too. A column's result depends only on
+its own keys and query, the partition count, the piece size and the page kind: not on the rows beside it, not on how
+many columns or rows its launch reads (a token decoded alone equals the same token inside a verify window, bit for
+bit). A launch given another tile or warp count keeps that only where the GPU multiplies it with mma.sync as well.
+Errors against float64 attention over the stored values: within 8e-3 absolute (BF16 queries and probabilities),
+log-sum-exps within 1e-3. E4M3 codes convert with the hardware conversion from sm_89 and with integer arithmetic before
+(the same bits).
 
 Defaults: the partition rule (`partitions`: about 1.5 programs per SM over FP8 and INT8 pages, 0.75 over 16-bit ones),
 the piece size (`piece_size`: 8,192 or 16,384 head values a piece), the tiles and their warps and stages were
@@ -58,8 +62,8 @@ of them, each reading the row's pages again (about the tile count times a tile's
 window above took 670 us that way). The reason: their tensor cores take four warps over 64 rows as warpgroup MMA
 (sm_90's wgmma, sm_100's and sm_110's tcgen05), another summation order than the mma.sync of the decode tiles, so a
 64-row tile there would give a window's column other bits than the same column decoded alone; a two-warp 64-row tile
-stays mma.sync but runs about 2x slower, and two 32-row dots in four warps spill. Wide windows at short contexts over many rows are bound by the partials (FP32, value width per query head,
-column and partition).
+stays mma.sync but runs about 2x slower, and two 32-row dots in four warps spill. Wide windows at short contexts over
+many rows are bound by the partials (FP32, value width per query head, column and partition).
 
 ## How to use
 {% if functions %}

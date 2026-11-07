@@ -444,3 +444,44 @@ def test_a_prompt_chunk_at_a_device_position_replays_from_one_cuda_graph(kind):
         want = pk.prefill(q, cache.k, cache.v, kind, table, at, 16, key_scales=cache.ks, value_scales=cache.vs,
                           multipliers=cache.multipliers)
         assert torch.equal(out, want), at
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("kind", ["fp8:row", "int8", "fp8", "bf16"])
+def test_a_prompt_chunk_reads_its_own_keys_and_values_fresh(kind):
+    # The positions before the chunk from the pages (at their kind's precision), the chunk's own from the fresh keys
+    # and values (here other values than its pages hold, so a read of its pages would show); with a first fresh
+    # position (on the device) the chunk's positions before it from the pages too, none fresh past the chunk.
+    cache = Cache(kind, 2, 128, 128, 16, [700])
+    g = torch.Generator().manual_seed(21)
+    q = _q(100, 8, 128, 22).to(torch.bfloat16)
+    fk = torch.randn(100, 2, 128, generator=g).to(dev).to(torch.bfloat16)
+    fv = torch.randn(100, 2, 128, generator=g).to(dev).to(torch.bfloat16)
+    table = cache.tables[0]
+    position = torch.zeros(1, dtype=torch.int64, device=dev)
+    first = torch.zeros(1, dtype=torch.int64, device=dev)
+    out, lse = torch.empty_like(q), torch.empty(100, 8, device=dev)
+    graphs = []
+    for fresh in ((fk, fv), (fk, fv, first)):
+        def launch(fresh=fresh):
+            pk.prefill(q, cache.k, cache.v, kind, table, position, 16, key_scales=cache.ks, value_scales=cache.vs,
+                       multipliers=cache.multipliers, out=out, lse=lse, fresh=fresh)
+        launch()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        graphs.append(graph)
+    qd = q.double()
+    for at in (0, 200, 600):
+        position.fill_(at)
+        for graph, split in ((graphs[0], 0), (graphs[1], 0), (graphs[1], 37), (graphs[1], 100), (graphs[1], 140)):
+            first.fill_(at + split)
+            graph.replay()
+            own = min(split, 100)
+            keys, values = cache.rows(0, at + own)
+            keys, values = torch.cat([keys, fk[own:].double()]), torch.cat([values, fv[own:].double()])
+            for t in (0, 41, 99):
+                seen = torch.arange(at + 100, device=dev) <= at + t
+                want, want_lse = reference(qd[t], keys, values, seen, 128 ** -0.5)
+                torch.testing.assert_close(out[t].double(), want, atol=8e-3, rtol=2e-2, msg=(at, split, t))
+                torch.testing.assert_close(lse[t].double(), want_lse, atol=1e-3, rtol=1e-4, msg=(at, split, t))
