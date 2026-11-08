@@ -1,0 +1,29 @@
+[general]
+name = "decode-gemv"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+edition = 6
+
+[general.hub]
+repo-id = "crit-labs/decode-gemv"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.decode_gemv]
+language = "cpp-cuda"
+depends = ["torch"]
+# The hardware E2M1 conversion needs the architecture-specific targets from sm_100a on; the plain targets decode by the
+# bit pattern, with the same bits.
+cuda-capabilities = ["8.0", "8.6", "8.9", "9.0", "10.0a", "10.3a", "11.0a", "12.0a", "12.1a"]
+src = [
+  "decode_gemv_cuda/binding.cu",
+  "decode_gemv_cuda/decode_gemv.cu",
+  "decode_gemv_cuda/decode_gemv.h",
+]

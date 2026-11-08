@@ -1,0 +1,31 @@
+[general]
+name = "mma-rows"
+license = "Apache-2.0"
+backends = [
+  "cuda",
+]
+version = 1
+edition = 6
+
+[general.hub]
+repo-id = "crit-labs/mma-rows"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.mma_rows]
+language = "cpp-cuda"
+depends = ["torch"]
+# mma.m16n8k16 with BF16 operands needs sm_80; the hardware E2M1 conversion needs the architecture-specific targets
+# from sm_100a on (the plain targets decode by the bit pattern, with the same values).
+cuda-capabilities = ["8.0", "8.6", "8.9", "9.0", "10.0a", "10.3a", "11.0a", "12.0a", "12.1a"]
+src = [
+  "mma_rows_cuda/binding.cu",
+  "mma_rows_cuda/mma_rows.cu",
+  "mma_rows_cuda/mma_rows.h",
+  "mma_rows_cuda/fp4_mma.cu",
+  "mma_rows_cuda/fp4_mma.h",
+]

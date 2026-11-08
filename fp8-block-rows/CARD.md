@@ -31,9 +31,12 @@ run the prompt kernel on a handful of rows to stay exact.
 ## Check it first
 
 Run `tests/fp8_block_tests.cu` on the target: the decode rows and the GEMM against the reference kernel bit for bit,
-over three scale layouts and shuffled jobs, the FP64 bound, and the quantizer against its host twin. crit's
-`fp8_block_cuda_tests` checks the order's assumption itself (rows and tokens moved across tile positions and
-companions) on the same GPU.
+over three scale layouts and shuffled jobs, the FP64 bound, and the quantizer against its host twin. Then
+`tests/fp8_block_order_tests.cu` (`nvcc -std=c++20 -O2 -arch=sm_<cc> -I tests/order tests/fp8_block_order_tests.cu`)
+checks the order's assumption itself on the same GPU: three implementations of the declared order
+(`tests/order/fp8_block_device.cuh`, the reference this project's kernels follow) with rows and tokens moved across
+tile positions and companions, bit for bit, and the device quantizer against its host twin (`tests/order/fp8_block.h`,
+a copy of crit's quantized-projections host code).
 
 ## How to use
 {% if functions %}
