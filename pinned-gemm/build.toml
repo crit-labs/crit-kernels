@@ -10,6 +10,11 @@ edition = 6
 [general.hub]
 repo-id = "crit-labs/pinned-gemm"
 
+[general.cuda]
+# cuBLASLt's per-row FP8 scale mode (CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F) comes with CUDA 13's cuBLAS, and
+# the block scales and their scale-mode attributes with 12.8: older toolkits do not build this kernel.
+minver = "13.0"
+
 [torch]
 src = [
   "torch-ext/torch_binding.cpp",
