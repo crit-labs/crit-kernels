@@ -22,6 +22,7 @@ reference, how a kernel is verified against it).
 | [int-block-experts](int-block-experts/CARD.md) | `crit-labs/int-block-experts` | host-expert-arithmetic: 4-bit integer block expert projections, bit-identical to crit's CPU rows |
 | [paged-kv-attention](paged-kv-attention/CARD.md) | `crit-labs/paged-kv-attention` | attention-state: page writes, split-KV decode and verify windows (trees, block lists) and prompt chunks over BF16, FP8 and INT8 pages (Triton) |
 | [recurrent-scans](recurrent-scans/CARD.md) | `crit-labs/recurrent-scans` | recurrent-state-recovery: kernels for the recurrent layers of hybrid models (gated delta and more) |
+| [topk-routing](topk-routing/CARD.md) | `crit-labs/topk-routing` | base/topk-router: top-k expert routing of router logits, a warp per token row (softmax or sigmoid scores, a correction bias, renormalization, scaling) |
 
 Each card lists the formats, GPUs, shapes, numerics and measured speed a kernel was checked for. Read it, and run the
 kernel's tests on your own target, before using it.
