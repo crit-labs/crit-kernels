@@ -9,7 +9,10 @@ import torch
 
 from ._ops import ops
 
-__all__ = ["causal_conv1d", "gated_delta_prefill", "gated_delta_scan", "ssd_prefill", "ssd_scan"]
+__all__ = ["causal_conv1d", "gated_delta_prefill", "gated_delta_scan", "ssd_prefill", "ssd_scan",
+           "STASH", "CHECKPOINTS", "RECOMPUTE", "FINAL", "FLUSH", "REPLAY", "FLUSH_PENDING",
+           "pool_blocks", "pool_half_floats", "pool_conv_blocks", "pool_delta", "pool_delta_replay", "pool_conv",
+           "conv_segments", "pool_conv_prompt", "pool_conv_supported"]
 
 
 def causal_conv1d(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor, bias: Optional[torch.Tensor] = None,
@@ -61,4 +64,94 @@ def ssd_scan(x: torch.Tensor, dt: torch.Tensor, B: torch.Tensor, C: torch.Tensor
     """Mamba-2 token by token; checkpoints [T, heads, head_dim, d_state] receives the state after every token."""
     out = torch.empty_like(x) if out is None else out
     ops.ssd_scan(out, state, x, dt, B, C, A, D, checkpoints)
+    return out
+
+
+# ------------------------------------------------------------------------------------------------- pools of sequences
+# Gated delta and the causal convolution over a pool of sequences (recurrent_rows.h): the decode and verify rows of many
+# sequences in one launch, each from its own sequence's state, and the device commit of a speculative round's accepted
+# prefix's arithmetic (the commit's bookkeeping, writing pending counts or selecting a checkpoint, is the caller's).
+# Row kinds:
+STASH, CHECKPOINTS, RECOMPUTE, FINAL, FLUSH = 0, 1, 2, 3, 4
+# and modes of pool_delta_replay:
+REPLAY, FLUSH_PENDING = 2, 3
+_COLUMNS, _CONV_THREADS = 32, 128
+
+
+def pool_blocks(v_heads: int, dv: int) -> int:
+    """Blocks of a layer's state per sequence: the pending counts (then as many stash parities) its control holds."""
+    return v_heads * ((dv + _COLUMNS - 1) // _COLUMNS)
+
+
+def pool_half_floats(k_heads: int, v_heads: int, dk: int, dv: int, capacity: int) -> int:
+    """Floats of one stash half: key [capacity][k_heads][dk], decay [capacity][v_heads], delta [capacity][v_heads][dv]."""
+    return capacity * (k_heads * dk + v_heads + v_heads * dv)
+
+
+def pool_conv_blocks(channels: int) -> int:
+    return (channels + _CONV_THREADS - 1) // _CONV_THREADS
+
+
+def pool_delta(out, states, stash, control, scratch, q, k, v, log_decay, beta, meta=None, starts=None, slots=None,
+               table=None, rows=0, kind=STASH, layer=0, capacity=1, epsilon=1e-6, scale=1.0, normalize_keys=True,
+               normalize_queries=True):
+    """One layer's rows: each row continues its sequence's state (states[layer][sequence], after its pending count)
+    over its tokens; out [T][v_heads][dv] FP32. q, k [T][k_heads][dk] and v [T][v_heads][dv] in FP32, BF16 or FP16
+    (rows contiguous), log_decay and beta [T][v_heads] FP32. Rows from meta ([rows][5] int32: first token, tokens,
+    sequence or -1, kind, scratch slot or -1) or a round's starts ([rows + 1] int32), slots ([rows] int64) and table
+    ([slots] int32 -> sequence or -1) with every row of `kind`. scratch [slots][...]: checkpoints [capacity + 1][state],
+    or the start or final state, by the meta row's scratch slot or the round slot; a FINAL, CHECKPOINTS or RECOMPUTE row
+    without scratch, and a row of no sequence, write zero outputs and touch no state. Capture-safe."""
+    ops.pool_delta(out, states, stash, control, scratch, q, k, v, log_decay, beta, meta, starts, slots, table, rows, kind,
+                   layer, capacity, epsilon, scale, normalize_keys, normalize_queries)
+    return out
+
+
+def pool_delta_replay(states, stash, control, scratch, accepted, meta=None, slots=None, table=None, rows=0, columns=0,
+                      capacity=1, key_heads=1, mode=REPLAY):
+    """Every layer's replay for each row: REPLAY replays accepted[r] ([rows] int64 on the device, clamped to
+    0 .. columns) stashed steps from the start state in scratch [layers][slots][state] into the live state (the
+    recompute commit), FLUSH_PENDING applies and consumes each row's sequence's pending count (accepted and scratch
+    unused). A row's pending count is control[l][sequence][:pool_blocks]: the caller writes it to commit deferred.
+    Capture-safe."""
+    ops.pool_delta_replay(states, stash, control, scratch, accepted, meta, slots, table, rows, columns, capacity, key_heads,
+                          mode)
+
+
+def pool_conv_supported(width: int, dilation: int = 1) -> bool:
+    """Whether the pool convolutions run `width` taps at `dilation`: 2 .. 8 taps undilated, 2 .. 4 taps at dilation
+    2 .. 4. A window holds the last (width - 1) * dilation inputs of each channel; the kernels read the dilation from
+    its width."""
+    if dilation == 1:
+        return 2 <= width <= 8
+    return 2 <= width <= 4 and 2 <= dilation <= 4
+
+
+def pool_conv(out, window, stash, pending, scratch, x, weight, bias=None, meta=None, starts=None, slots=None, table=None,
+              rows=0, kind=STASH, layer=0, layers=1, capacity=1, silu=True):
+    """The causal depthwise convolution of rows over their sequences' windows (window[layer][sequence], after the
+    pending count): x and out [T][channels] (x's dtype; out not x), weight [channels][width] FP32; window
+    [layers][sequences][channels][(width - 1) * dilation] (its last dimension sets the dilation, pool_conv_supported):
+    y[t] = act(bias + sum_i weight[i] x[t - (width - 1 - i) * dilation]). STASH rows keep
+    their inputs for the deferred commit, FINAL rows write the window after their last input to scratch [slots][...],
+    FLUSH rows (over `layers` layers from `layer`) apply the pending count only. Capture-safe."""
+    ops.pool_conv(out, window, stash, pending, scratch, x, weight, bias, meta, starts, slots, table, rows, kind, layer,
+                  layers, capacity, silu)
+    return out
+
+
+def conv_segments(out, window_in, window_out, x, weight, bias=None, silu=True):
+    """One long row out of place from window_in ([channels][(width - 1) * dilation]: its width sets the dilation),
+    the window after its last input to window_out: a thread per channel and 32 rows, the bits of pool_conv's."""
+    ops.conv_segments(out, window_in, window_out, x, weight, bias, silu)
+    return out
+
+
+def pool_conv_prompt(out, window, stash, pending, x, weight, bias=None, meta=None, layer=0, capacity=1, silu=True):
+    """One sequence's prompt chunk padded to x's rows (a captured graph's bucket): meta [5] int32 on the device (first,
+    count, sequence, kind, slot; count and sequence read) says how many rows are real and whose window they continue.
+    The real rows convolve from window[layer][sequence] after its pending count (applied and consumed), the padding
+    rows output zeros, and the window after the real inputs is written in place; a sequence below 0 outputs zeros and
+    touches no window. The bits of pool_conv's and conv_segments'. Capture-safe: the same launch for any chunk."""
+    ops.pool_conv_prompt(out, window, stash, pending, x, weight, bias, meta, layer, capacity, silu)
     return out

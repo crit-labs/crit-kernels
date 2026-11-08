@@ -23,4 +23,7 @@ src = [
   "recurrent_scans_cuda/binding.cu",
   "recurrent_scans_cuda/recurrent_kernels.cu",
   "recurrent_scans_cuda/recurrent_kernels.h",
+  "recurrent_scans_cuda/pool_binding.cu",
+  "recurrent_scans_cuda/recurrent_rows.cu",
+  "recurrent_scans_cuda/recurrent_rows.h",
 ]
