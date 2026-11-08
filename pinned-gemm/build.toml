@@ -28,6 +28,6 @@ depends = ["torch"]
 # MXFP8 and NVFP4 formats from sm_100).
 cuda-capabilities = ["8.0", "8.6", "8.9", "9.0", "10.0a", "10.3a", "11.0a", "12.0a", "12.1a"]
 src = [
-  "pinned_gemm_cuda/pinned_gemm.cu",
+  "pinned_gemm_cuda/pinned_gemm.cpp",
   "pinned_gemm_cuda/pinned_gemm.h",
 ]
