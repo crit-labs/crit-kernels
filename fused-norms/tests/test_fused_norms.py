@@ -197,6 +197,15 @@ def calls(width, heads, dim, rotary):
         kept = streams[:k].clone()
         return fn.stream_add(kept, x[:k].clone(), per_stream[:k].clone())
 
+    def added_normed(k):
+        kept = streams[:k].clone()
+        y, _ = fn.stream_add_norm(kept, x[:k].clone(), per_stream[:k].clone(), sw, 1e-6, 1.0, torch.bfloat16)
+        return torch.cat([y.float(), kept], -1)
+
+    kv = normal(g, n, max(1, heads // 4), dim, scale=2, dtype=torch.bfloat16)
+    ba = normal(g, n, 96, scale=4, dtype=torch.bfloat16)
+    rate, bias = normal(g, 48).exp(), normal(g, 48)
+
     return {
         "rms_norm": lambda k: fn.rms_norm(x[:k].clone(), w, 1e-6),
         "rms_norm residual": lambda k: torch.cat([t.float() for t in fn.rms_norm(
@@ -212,6 +221,11 @@ def calls(width, heads, dim, rotary):
         "rms_norm per stream": lambda k: fn.rms_norm(streams[:k].clone(), sw, 1e-6, offset=1.0, out_dtype=torch.bfloat16),
         "stream_sum": lambda k: fn.stream_sum(streams[:k].clone(), gates[:k].clone(), "sigmoid", 0.25),
         "stream_add": added,
+        "stream_add_norm": added_normed,
+        "rms_norm_rope_pair": lambda k: torch.cat([t.flatten(1) for t in fn.rms_norm_rope_pair(
+            h[:k].clone(), kv[:k].clone(), hw, hw, 1e-6, positions[:k].clone(), freqs, offset=1.0)], -1),
+        "softplus_decay": lambda k: torch.cat(fn.softplus_decay(ba[:k, 48:].clone(), bias, rate,
+                                                                ba[:k, :48].clone()), -1),
     }
 
 
@@ -359,6 +373,140 @@ def test_a_captured_graph_replays_the_eager_bits():
     graph.replay()
     replayed = [t.clone() for t in captured]
     residual.copy_(start)
+    for a, b in zip(replayed, run()):
+        assert torch.equal(a, b)
+
+
+# -- fused forms ---------------------------------------------------------------------------------------------------
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("hq,hk,dim,rotary", [(24, 4, 256, 64), (32, 8, 128, 128), (56, 8, 128, 64), (3, 5, 96, 32),
+                                              (16, 16, 64, 64)])
+def test_the_query_key_pair_is_the_two_calls_in_one_launch(dtype, hq, hk, dim, rotary):
+    # the pair gives each tensor the bits its own rms_norm_rope call gives: views of a gated qkv projection's output,
+    # weights per head or shared, inverse frequencies or a table, both styles, FP32 or 16-bit out, in place
+    g = gen(hq * 1000 + dim)
+    for T in (1, 4, 9, 77):
+        qkv = normal(g, T, hq * 2 * dim + 2 * hk * dim, scale=2, dtype=dtype)
+        q = qkv[:, :hq * 2 * dim].view(T, hq, 2 * dim)[..., :dim]
+        k = qkv[:, hq * 2 * dim:hq * 2 * dim + hk * dim].view(T, hk, dim)
+        positions = torch.randint(0, 1 << 18, (T,), generator=g).to(dev)
+        table = torch.cat([torch.cos(torch.arange(4096.0)[:, None] * inv_freq(rotary, 1e4).cpu()[None]),
+                           torch.sin(torch.arange(4096.0)[:, None] * inv_freq(rotary, 1e4).cpu()[None])], -1).to(dev)
+        for wq, wk in ((normal(g, dim) * 0.2, normal(g, dim) * 0.2), (normal(g, hq, dim), normal(g, hk, dim)),
+                       (None, None)):
+            for freqs, style, out_dtype in ((inv_freq(rotary, 1e7), "half", torch.bfloat16),
+                                            (table, "interleaved", torch.float32), (inv_freq(rotary, 1e4), "half", None)):
+                one = [fn.rms_norm_rope(t, w, 1e-6, positions, freqs, 1.0, rotary, style, 0.5, out_dtype)
+                       for t, w in ((q, wq), (k, wk))]
+                pair = fn.rms_norm_rope_pair(q, k, wq, wk, 1e-6, positions, freqs, 1.0, rotary, style, 0.5, out_dtype)
+                for a, b in zip(pair, one):
+                    assert torch.equal(a, b)
+                if wq is None:
+                    pair = fn.rope_pair(q, k, positions, freqs, rotary, style, 0.5, out_dtype)
+                    one = [fn.rope(t, positions, freqs, rotary, style, 0.5, out_dtype) for t in (q, k)]
+                    for a, b in zip(pair, one):
+                        assert torch.equal(a, b)
+        qi, ki = q.contiguous(), k.contiguous()
+        expected = fn.rms_norm_rope_pair(qi, ki, wq, wk, 1e-6, positions, inv_freq(rotary, 1e4))
+        found = fn.rms_norm_rope_pair(qi, ki, wq, wk, 1e-6, positions, inv_freq(rotary, 1e4), q_out=qi, k_out=ki)
+        assert found[0] is qi and found[1] is ki
+        assert torch.equal(qi, expected[0]) and torch.equal(ki, expected[1])
+    pair = fn.rms_norm_rope_pair(q, k, None, None, 1e-6, positions, inv_freq(rotary, 1e4), 1.0, rotary, "half", 0.5)
+    close(pair[0], ref_rope(ref_rms(q, None, 1e-6), positions, inv_freq(rotary, 1e4), rotary, "half", 0.5), dtype)
+    close(pair[1], ref_rope(ref_rms(k, None, 1e-6), positions, inv_freq(rotary, 1e4), rotary, "half", 0.5), dtype)
+
+
+@pytest.mark.kernels_ci
+def test_softplus_decay_is_torchs_softplus_and_sigmoid():
+    g = gen(23)
+    for T in (1, 4, 9, 512):
+        ba = normal(g, T, 96, scale=4, dtype=torch.bfloat16)
+        rate, bias = normal(g, 48).exp(), normal(g, 48)
+        f32 = ba.float()
+        decay, beta = fn.softplus_decay(ba[:, 48:], bias, rate, gate=ba[:, :48])
+        assert torch.equal(decay, -rate * torch.nn.functional.softplus(f32[:, 48:] + bias))
+        assert torch.equal(beta, torch.sigmoid(f32[:, :48]))
+        wide = normal(g, T, 48, scale=30)
+        # FP32 inside: against FP64 from the FP32 sum x + bias (values below FP32's normal range flush to zero)
+        expected = -rate.double() * torch.nn.functional.softplus((wide + bias).double())
+        found = fn.softplus_decay(wide, bias, rate)
+        assert ((found.double() - expected).abs() <= 5e-7 * expected.abs() + 1e-37).all()
+        assert fn.softplus_decay(wide, bias, rate, out_dtype=torch.bfloat16).dtype == torch.bfloat16
+    nan = torch.full((2, 48), float("nan"), device=dev)
+    assert torch.isnan(fn.softplus_decay(nan, bias, rate, nan)[0]).all()
+    assert torch.isnan(fn.softplus_decay(nan, bias, rate, nan)[1]).all()
+    for bad in (lambda: fn.softplus_decay(ba, bias, rate), lambda: fn.softplus_decay(ba[:, 48:], bias[:47], rate),
+                lambda: fn.softplus_decay(ba[:, 48:], bias, rate, ba[:2, :48]),
+                lambda: fn.softplus_decay(ba[:, 48:].cpu(), bias.cpu(), rate.cpu())):
+        with pytest.raises(ValueError):
+            bad()
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_a_row_added_into_the_streams_with_their_norms_is_the_two_calls(dtype):
+    g = gen(29)
+    for S, D in ((4, 2560), (4, 7168), (2, 5120), (3, 4100)):
+        for T in (1, 4, 9, 100):
+            streams, row = normal(g, T, S, D, scale=2, dtype=dtype), normal(g, T, D, scale=2, dtype=torch.bfloat16)
+            for weights, weight in ((normal(g, T, S), normal(g, S, D) * 0.2), (None, normal(g, D) * 0.2),
+                                    (normal(g, T, S), None)):
+                kept = streams.clone()
+                fn.stream_add(kept, row, weights)
+                expected = fn.rms_norm(kept, weight, 1e-6, 1.0, out_dtype=torch.bfloat16)
+                found = streams.clone()
+                y, same = fn.stream_add_norm(found, row, weights, weight, 1e-6, 1.0, torch.bfloat16)
+                assert same is found and torch.equal(found, kept) and torch.equal(y, expected)
+    odd = normal(g, 4, 3 * 2560 + 1, dtype=dtype)[:, 1:].view(4, 3, 2560)        # unaligned streams: padded copies
+    row, weights = normal(g, 4, 2560, dtype=dtype), normal(g, 4, 3)
+    kept = odd.clone()
+    fn.stream_add(kept, row, weights)
+    y, _ = fn.stream_add_norm(odd, row, weights, None, 1e-6)
+    assert torch.equal(odd, kept) and torch.equal(y, fn.rms_norm(kept, None, 1e-6))
+    for bad in (lambda: fn.stream_add_norm(odd, row[:3], weights, None, 1e-6),
+                lambda: fn.stream_add_norm(odd, row, weights[:, :2], None, 1e-6),
+                lambda: fn.stream_add_norm(odd[:, 0], row, None, None, 1e-6)):
+        with pytest.raises(ValueError):
+            bad()
+
+
+@pytest.mark.kernels_ci
+def test_a_captured_graph_replays_the_fused_forms_bits():
+    g = gen(31)
+    T = 5
+    qkv = normal(g, T, 24 * 512 + 2048, dtype=torch.bfloat16)
+    q, k = qkv[:, :12288].view(T, 24, 512)[..., :256], qkv[:, 12288:13312].view(T, 4, 256)
+    wq, wk = normal(g, 256) * 0.2, normal(g, 256) * 0.2
+    positions = torch.randint(0, 1 << 16, (T,), generator=g).to(dev)
+    freqs = inv_freq(64, 1e7)
+    ba, rate, bias = normal(g, T, 96, dtype=torch.bfloat16), normal(g, 48).exp(), normal(g, 48)
+    streams, row, weights = normal(g, T, 4, 2560), normal(g, T, 2560, dtype=torch.bfloat16), normal(g, T, 4)
+    sw = normal(g, 4, 2560) * 0.2
+
+    def run():
+        y, kept = fn.stream_add_norm(streams, row, weights, sw, 1e-6, 1.0, torch.bfloat16)
+        return [*fn.rms_norm_rope_pair(q, k, wq, wk, 1e-6, positions, freqs, 1.0, 64),
+                *fn.softplus_decay(ba[:, 48:], bias, rate, ba[:, :48]), y, kept.clone()]
+
+    start = streams.clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    streams.copy_(start)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    g2 = gen(32)
+    for t in (qkv, ba, streams, row, weights):
+        t.copy_(normal(g2, *t.shape, dtype=t.dtype))
+    positions.copy_(torch.randint(0, 1 << 16, (T,), generator=g2).to(dev))
+    start = streams.clone()
+    graph.replay()
+    replayed = [t.clone() for t in captured]
+    streams.copy_(start)
     for a, b in zip(replayed, run()):
         assert torch.equal(a, b)
 

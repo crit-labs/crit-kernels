@@ -6,6 +6,7 @@ one row and in a call of thousands. The row count enters only the grid and the r
 """
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 # NORM: 0 none, 1 RMS (mean of squares), 2 L2 (sum of squares). GATE: 0 none, 1 silu, 2 sigmoid.
 # ROPE: 0 none, 1 half (pairs j, j + R / 2), 2 interleaved (pairs 2j, 2j + 1). ACT: 0 silu, 1 gelu, 2 gelu_tanh,
@@ -34,17 +35,18 @@ def _activation(g, ACT: tl.constexpr):
     return out
 
 
-@triton.jit(do_not_specialize=["n_rows"])
-def rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups, swg, y_ptr, sya, syb,
-                pos_ptr, f_ptr, sf, n_table, n_rows, B, n_blocks, D, R, eps, offset, scale,
-                NORM: tl.constexpr, HAS_RES: tl.constexpr, HAS_W: tl.constexpr, GROUPED: tl.constexpr,
-                GATE: tl.constexpr, ROPE: tl.constexpr, TABLE: tl.constexpr, IN_PLACE: tl.constexpr,
-                HB: tl.constexpr, BD: tl.constexpr):
+@triton.jit
+def _rows_body(pid, x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups, swg, y_ptr, sya, syb,
+               pos_ptr, f_ptr, sf, n_table, n_rows, B, n_blocks, D, R, eps, offset, scale, xw_ptr, sxwa, sxwb,
+               NORM: tl.constexpr, HAS_RES: tl.constexpr, HAS_W: tl.constexpr, GROUPED: tl.constexpr,
+               GATE: tl.constexpr, ROPE: tl.constexpr, TABLE: tl.constexpr, IN_PLACE: tl.constexpr,
+               HAS_XW: tl.constexpr, HB: tl.constexpr, BD: tl.constexpr):
     """Rows of D values at x[a * sxa + b * sxb + d]: without rope, rows r = a * B + b of n_rows, HB consecutive rows a
     program; with rope, a program is token a's heads b of one block of HB (n_blocks blocks a token). GROUPED: the
     weight has one row (swg apart) per group, row r (head b with rope) taking row r % groups (b % groups). IN_PLACE
-    (rope writing into x): every thread's loads, its partners' included, finish before any store."""
-    pid = tl.program_id(0)
+    (rope writing into x): every thread's loads, its partners' included, finish before any store. HAS_XW (with a
+    residual): x of each row times its own weight xw[a * sxwa + b * sxwb] before the add (a row added into every
+    stream: sxb 0)."""
     if ROPE != 0:
         a = (pid // n_blocks).to(tl.int64)
         b = (pid % n_blocks) * HB + tl.arange(0, HB)
@@ -66,6 +68,8 @@ def rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups
     m = rm[:, None] & dm[None, :]
     x_rows = a_rows * sxa + b * sxb
     x = tl.load(x_ptr + x_rows[:, None] + d[None, :], mask=m, other=0.0).to(tl.float32)
+    if HAS_XW:
+        x = x * tl.load(xw_ptr + a_rows * sxwa + b * sxwb, mask=rm, other=0.0).to(tl.float32)[:, None]
     if HAS_RES:
         r_rows = a_rows * sra + b * srb
         s = (tl.load(r_ptr + r_rows[:, None] + d[None, :], mask=m, other=0.0).to(tl.float32) + x)
@@ -129,6 +133,60 @@ def rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups
     if IN_PLACE:
         tl.debug_barrier()
     tl.store(y_ptr + y_rows[:, None] + d[None, :], y.to(y_ptr.dtype.element_ty), mask=m)
+
+
+@triton.jit(do_not_specialize=["n_rows"])
+def rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups, swg, y_ptr, sya, syb,
+                pos_ptr, f_ptr, sf, n_table, n_rows, B, n_blocks, D, R, eps, offset, scale, xw_ptr, sxwa, sxwb,
+                NORM: tl.constexpr, HAS_RES: tl.constexpr, HAS_W: tl.constexpr, GROUPED: tl.constexpr,
+                GATE: tl.constexpr, ROPE: tl.constexpr, TABLE: tl.constexpr, IN_PLACE: tl.constexpr,
+                HAS_XW: tl.constexpr, HB: tl.constexpr, BD: tl.constexpr):
+    """Every row of one tensor (_rows_body)."""
+    _rows_body(tl.program_id(0), x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups, swg, y_ptr, sya,
+               syb, pos_ptr, f_ptr, sf, n_table, n_rows, B, n_blocks, D, R, eps, offset, scale, xw_ptr, sxwa, sxwb,
+               NORM, HAS_RES, HAS_W, GROUPED, GATE, ROPE, TABLE, IN_PLACE, HAS_XW, HB, BD)
+
+
+@triton.jit(do_not_specialize=["tokens"])
+def pair_kernel(x_ptr, sxa, sxb, w_ptr, groups, swg, y_ptr, sya, syb, B, n_blocks,
+                x2_ptr, sx2a, sx2b, w2_ptr, groups2, swg2, y2_ptr, sy2a, sy2b, B2, n_blocks2, tokens,
+                pos_ptr, f_ptr, sf, n_table, D, R, eps, offset, scale,
+                NORM: tl.constexpr, HAS_W: tl.constexpr, GROUPED: tl.constexpr, GROUPED2: tl.constexpr,
+                ROPE: tl.constexpr, TABLE: tl.constexpr, IN_PLACE: tl.constexpr, IN_PLACE2: tl.constexpr,
+                HB: tl.constexpr, BD: tl.constexpr):
+    """Two head tensors of the same tokens (queries and keys) in one launch: the first tokens * n_blocks programs the
+    first tensor's heads, the rest the second's, each the body rope rows run (_rows_body), its own weight."""
+    pid = tl.program_id(0)
+    first = tokens * n_blocks
+    if pid < first:
+        _rows_body(pid, x_ptr, sxa, sxb, x_ptr, 0, 0, x_ptr, 0, 0, w_ptr, groups, swg, y_ptr, sya, syb,
+                   pos_ptr, f_ptr, sf, n_table, 0, B, n_blocks, D, R, eps, offset, scale, x_ptr, 0, 0,
+                   NORM, False, HAS_W, GROUPED, 0, ROPE, TABLE, IN_PLACE, False, HB, BD)
+    else:
+        _rows_body(pid - first, x2_ptr, sx2a, sx2b, x2_ptr, 0, 0, x2_ptr, 0, 0, w2_ptr, groups2, swg2, y2_ptr, sy2a,
+                   sy2b, pos_ptr, f_ptr, sf, n_table, 0, B2, n_blocks2, D, R, eps, offset, scale, x2_ptr, 0, 0,
+                   NORM, False, HAS_W, GROUPED2, 0, ROPE, TABLE, IN_PLACE2, False, HB, BD)
+
+
+@triton.jit
+def softplus_decay_kernel(x_ptr, sxa, b_ptr, rate_ptr, g_ptr, sga, y_ptr, sya, beta_ptr, sba, N, n_blocks,
+                          HAS_GATE: tl.constexpr, BLOCK: tl.constexpr):
+    """y[t][i] = -rate[i] * softplus(x[t][i] + bias[i]) (softplus(v) = v past 20, log1p(exp(v)) below), and with a
+    gate beta[t][i] = sigmoid(g[t][i]), BLOCK values of one row a program; FP32 inside, with the CUDA math library's
+    exp and log1p and an IEEE division (the values torch's own softplus and sigmoid give on CUDA)."""
+    pid = tl.program_id(0)
+    t = (pid // n_blocks).to(tl.int64)
+    i = (pid % n_blocks) * BLOCK + tl.arange(0, BLOCK)
+    m = i < N
+    v = tl.load(x_ptr + t * sxa + i, mask=m, other=0.0).to(tl.float32)
+    v = v + tl.load(b_ptr + i, mask=m, other=0.0).to(tl.float32)
+    soft = tl.where(v > 20.0, v, libdevice.log1p(libdevice.exp(v)))       # exp overflowing past 88 is not chosen
+    rate = tl.load(rate_ptr + i, mask=m, other=0.0).to(tl.float32)
+    tl.store(y_ptr + t * sya + i, (-rate * soft).to(y_ptr.dtype.element_ty), mask=m)
+    if HAS_GATE:
+        g = tl.load(g_ptr + t * sga + i, mask=m, other=0.0).to(tl.float32)
+        beta = tl.math.div_rn(tl.full([BLOCK], 1.0, tl.float32), 1.0 + libdevice.exp(-g))
+        tl.store(beta_ptr + t * sba + i, beta.to(beta_ptr.dtype.element_ty), mask=m)
 
 
 @triton.jit

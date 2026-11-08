@@ -3,8 +3,10 @@ RMSNorm with a residual added in place (an FP32 residual stream beside 16-bit ro
 weight stored as weight - 1), one weight per group of rows (several residual streams normalized at once) and a chosen
 output dtype; query/key head norms, alone or with rotary positions; the gated RMSNorm of linear-attention outputs;
 rotary positions (half or interleaved pairs, partial, inverse frequencies or a cos|sin table); SiLU, GELU and sigmoid
-products; L2 norms; and the mixes of several residual streams: a gated or weighted sum over the streams, and one row
-added into every stream with a weight per stream.
+products; L2 norms; the mixes of several residual streams: a gated or weighted sum over the streams, and one row
+added into every stream with a weight per stream. Fused forms save launches where a layer runs these back to back:
+the query and key norms with rotary positions in one launch, a row added into the streams with the streams' norms, and
+the softplus log-decay and sigmoid gate of a state-space or gated linear-attention layer.
 
 Inputs BF16, FP16 or FP32 on a CUDA device, each read in its own dtype; FP32 inside; one rounding, to out_dtype (by
 default the dtype of the tensor normalized or gated). The last dimension is contiguous and the others may have any
@@ -23,8 +25,9 @@ import torch
 
 from . import _triton
 
-__all__ = ["gated_rms_norm", "gelu_mul", "l2_norm", "rms_norm", "rms_norm_heads", "rms_norm_rope", "rope",
-           "sigmoid_mul", "silu_mul", "stream_add", "stream_sum"]
+__all__ = ["gated_rms_norm", "gelu_mul", "l2_norm", "rms_norm", "rms_norm_heads", "rms_norm_rope", "rms_norm_rope_pair",
+           "rope", "rope_pair", "sigmoid_mul", "silu_mul", "softplus_decay", "stream_add", "stream_add_norm",
+           "stream_sum"]
 
 FLOATS = (torch.bfloat16, torch.float16, torch.float32)
 ROW_ELEMENTS = 4096      # values a program holds: rows of up to this width one a program, shorter ones several
@@ -179,8 +182,9 @@ def _rows(x, weight, eps, offset, norm, residual=None, z=None, gate=0, out_dtype
         if block <= WIDEST_BLOCK:
             _triton.rows_kernel[(_cdiv(n_rows, rows),)](
                 x, *sx, r, *sr, g, *sz, w, groups, swg, y, *sy, x, x, 0, 1, n_rows, B, 1, width, 0, float(eps),
-                float(offset), 1.0, NORM=norm, HAS_RES=residual is not None, HAS_W=weight is not None,
-                GROUPED=grouped, GATE=gate, ROPE=0, TABLE=False, IN_PLACE=False, HB=rows, BD=block, num_warps=warps)
+                float(offset), 1.0, x, 0, 0, NORM=norm, HAS_RES=residual is not None, HAS_W=weight is not None,
+                GROUPED=grouped, GATE=gate, ROPE=0, TABLE=False, IN_PLACE=False, HAS_XW=False, HB=rows, BD=block,
+                num_warps=warps)
         else:
             _triton.long_rows_kernel[(n_rows,)](
                 x, *sx, r, *sr, g, *sz, w, groups, swg, y, *sy, B, width, float(eps), float(offset),
@@ -275,9 +279,9 @@ def _rope(x, positions, freqs, rotary_dim, style, scale, weight, eps, offset, no
         _triton.rows_kernel[(tokens * n_blocks,)](
             x, *sx, x, 0, 0, x, 0, 0, weight if weight is not None else x, groups, swg, y, *sy,
             positions, freqs, freqs.stride(0) if table else 0, freqs.shape[0] if table else 1, tokens * heads, heads,
-            n_blocks, width, rotary_dim, float(eps), float(offset), float(scale),
+            n_blocks, width, rotary_dim, float(eps), float(offset), float(scale), x, 0, 0,
             NORM=norm, HAS_RES=False, HAS_W=weight is not None, GROUPED=grouped, GATE=0, ROPE=STYLES[style],
-            TABLE=table, IN_PLACE=y.data_ptr() == x.data_ptr(), HB=rows, BD=block, num_warps=warps)
+            TABLE=table, IN_PLACE=y.data_ptr() == x.data_ptr(), HAS_XW=False, HB=rows, BD=block, num_warps=warps)
     return y
 
 
@@ -435,3 +439,167 @@ def stream_add(streams: torch.Tensor, x: torch.Tensor, weights: Optional[torch.T
             streams, streams.stride(0), streams.stride(1), x, x.stride(0), weights if weights is not None else x,
             *sw, count, width, n_blocks, HAS_W=weights is not None, BLOCK=PRODUCT_BLOCK, num_warps=4)
     return streams
+
+
+def _heads3(x, what):
+    _check(x, what)
+    if x.dim() != 3:
+        raise ValueError(f"{what} is [tokens][heads][dim], not {tuple(x.shape)}")
+
+
+def rms_norm_rope_pair(q: torch.Tensor, k: torch.Tensor, q_weight: Optional[torch.Tensor],
+                       k_weight: Optional[torch.Tensor], eps: float, positions: torch.Tensor, freqs: torch.Tensor,
+                       offset: float = 0.0, rotary_dim: Optional[int] = None, style: str = "half", scale: float = 1.0,
+                       out_dtype: Optional[torch.dtype] = None, q_out: Optional[torch.Tensor] = None,
+                       k_out: Optional[torch.Tensor] = None):
+    """rms_norm_rope of the queries and of the keys of the same tokens in one launch: q [tokens][q heads][dim] with
+    q_weight, k [tokens][k heads][dim] with k_weight (each [dim] or one row per head, or None), the same positions,
+    frequencies, offset, style and output dtype; (q_out, k_out). Each tensor gets the bits its own rms_norm_rope call
+    gives it (the kernel tests check this at the head counts and sizes of the families measured)."""
+    return _pair(q, k, q_weight, k_weight, eps, positions, freqs, offset, rotary_dim, style, scale, out_dtype, q_out,
+                 k_out, 1)
+
+
+def rope_pair(q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor, freqs: torch.Tensor,
+              rotary_dim: Optional[int] = None, style: str = "half", scale: float = 1.0,
+              out_dtype: Optional[torch.dtype] = None, q_out: Optional[torch.Tensor] = None,
+              k_out: Optional[torch.Tensor] = None):
+    """rope of the queries and of the keys of the same tokens in one launch (families without query/key norms):
+    q [tokens][q heads][dim], k [tokens][k heads][dim]; (q_out, k_out), each the bits its own rope call gives."""
+    return _pair(q, k, None, None, 0.0, positions, freqs, 0.0, rotary_dim, style, scale, out_dtype, q_out, k_out, 0)
+
+
+def _pair(q, k, q_weight, k_weight, eps, positions, freqs, offset, rotary_dim, style, scale, out_dtype, q_out, k_out,
+          norm):
+    _heads3(q, "q")
+    _heads3(k, "k")
+    if k.device != q.device or k.dtype != q.dtype or k.shape[0] != q.shape[0] or k.shape[-1] != q.shape[-1]:
+        raise ValueError(f"q {tuple(q.shape)} {q.dtype} and k {tuple(k.shape)} {k.dtype}: the same tokens, head size, "
+                         "dtype and device")
+    if style not in STYLES:
+        raise ValueError(f"style is one of {', '.join(STYLES)}, not {style!r}")
+    tokens, width = q.shape[0], q.shape[-1]
+    if (positions.shape != (tokens,) or positions.device != q.device
+            or positions.dtype not in (torch.int64, torch.int32)):
+        raise ValueError(f"positions [tokens] int64 or int32 on {q.device}, not {tuple(positions.shape)} "
+                         f"{positions.dtype} on {positions.device}")
+    if (q_weight is None) != (k_weight is None):
+        raise ValueError("q and k both have a weight or neither")
+    groups, swg, grouped = _weight(q_weight, q)
+    groups2, swg2, grouped2 = _weight(k_weight, k)
+    rotary_dim = _rotary(freqs, rotary_dim, width, q.device)
+    block, rows, warps = _config(width)
+    if block > WIDEST_BLOCK:
+        raise ValueError(f"heads of {width} values are wider than rope's {WIDEST_BLOCK}")
+    heads, heads2 = q.shape[1], k.shape[1]
+    rows = min(rows, 1 << (max(heads, heads2, 1) - 1).bit_length())
+    warps = max(1, min(16, block * rows // 512))
+    yq = _result(q, q.shape, out_dtype, q_out)
+    yk = _result(k, k.shape, out_dtype, k_out)
+    if tokens == 0 or heads == 0 or heads2 == 0:
+        return (_rope(q, positions, freqs, rotary_dim, style, scale, q_weight, eps, offset, norm, yq.dtype, yq),
+                _rope(k, positions, freqs, rotary_dim, style, scale, k_weight, eps, offset, norm, yk.dtype, yk))
+    weights = [w for w in (q_weight, k_weight) if w is not None]
+    sq, sk = (q.stride(0), q.stride(1)), (k.stride(0), k.stride(1))
+    syq, syk = (yq.stride(0), yq.stride(1)), (yk.stride(0), yk.stride(1))
+    if not _aligned([q, k, yq, yk] + weights, [sq, sk, syq, syk]):
+        # a layout the kernel cannot read aligned: aligned padded copies, the results copied back (in place too)
+        fq, fk = _padded(yq, copy=False), _padded(yk, copy=False)
+        if q_weight is not None and q_weight.data_ptr() % 16:
+            q_weight = q_weight.clone()
+        if k_weight is not None and k_weight.data_ptr() % 16:
+            k_weight = k_weight.clone()
+        _pair(_padded(q), _padded(k), q_weight, k_weight, eps, positions, freqs, offset, rotary_dim, style, scale,
+              yq.dtype, fq, fk, norm)
+        yq.copy_(fq)
+        yk.copy_(fk)
+        return yq, yk
+    positions = positions.contiguous()
+    n_blocks, n_blocks2 = _cdiv(heads, rows), _cdiv(heads2, rows)
+    table = freqs.dim() == 2
+    with _on(q):
+        _triton.pair_kernel[(tokens * (n_blocks + n_blocks2),)](
+            q, *sq, q_weight if q_weight is not None else q, groups, swg, yq, *syq, heads, n_blocks,
+            k, *sk, k_weight if k_weight is not None else k, groups2, swg2, yk, *syk, heads2, n_blocks2, tokens,
+            positions, freqs, freqs.stride(0) if table else 0, freqs.shape[0] if table else 1, width, rotary_dim,
+            float(eps), float(offset), float(scale),
+            NORM=norm, HAS_W=q_weight is not None, GROUPED=grouped, GROUPED2=grouped2, ROPE=STYLES[style], TABLE=table,
+            IN_PLACE=yq.data_ptr() == q.data_ptr(), IN_PLACE2=yk.data_ptr() == k.data_ptr(), HB=rows, BD=block,
+            num_warps=warps)
+    return yq, yk
+
+
+def softplus_decay(x: torch.Tensor, bias: torch.Tensor, rate: torch.Tensor, gate: Optional[torch.Tensor] = None,
+                   out_dtype: Optional[torch.dtype] = None, out: Optional[torch.Tensor] = None,
+                   gate_out: Optional[torch.Tensor] = None):
+    """decay = -rate * softplus(x + bias) per row of x [tokens][n] (bias and rate [n]; softplus(v) is v past 20,
+    log1p(exp(v)) below, as torch's), the discretized log-decay of a state-space or gated linear-attention layer (rate
+    exp(A_log)); with gate (x's shape), also sigmoid(gate): (decay, sigmoid(gate)). One launch, FP32 inside, out_dtype
+    out (FP32 by default; gate_out takes the gate's). Results below FP32's normal range flush to zero."""
+    _check(x)
+    if x.dim() != 2:
+        raise ValueError(f"x is [tokens][n], not {tuple(x.shape)}")
+    tokens, n = x.shape
+    for t, what in ((bias, "bias"), (rate, "rate")):
+        _check(t, what, x.device)
+        if tuple(t.shape) != (n,):
+            raise ValueError(f"{what} is [n] for x of shape {tuple(x.shape)}, not {tuple(t.shape)}")
+    if gate is not None:
+        _check(gate, "gate", x.device)
+        if gate.shape != x.shape:
+            raise ValueError(f"a gate of shape {tuple(gate.shape)} for x of shape {tuple(x.shape)}")
+    out_dtype = out_dtype or torch.float32
+    y = _result(x, x.shape, out_dtype, out)
+    beta = _result(x, x.shape, out_dtype, gate_out) if gate is not None else None
+    if tokens and n:
+        n_blocks = _cdiv(n, PRODUCT_BLOCK)
+        g = gate if gate is not None else x
+        b = beta if beta is not None else y
+        with _on(x):
+            _triton.softplus_decay_kernel[(tokens * n_blocks,)](
+                x, x.stride(0), bias, rate, g, g.stride(0), y, y.stride(0), b, b.stride(0), n, n_blocks,
+                HAS_GATE=gate is not None, BLOCK=PRODUCT_BLOCK, num_warps=4)
+    return y if gate is None else (y, beta)
+
+
+def stream_add_norm(streams: torch.Tensor, x: torch.Tensor, weights: Optional[torch.Tensor],
+                    weight: Optional[torch.Tensor], eps: float, offset: float = 0.0,
+                    out_dtype: Optional[torch.dtype] = None, out: Optional[torch.Tensor] = None):
+    """stream_add, then rms_norm of every stream, in one launch: streams[t][s] += weights[t][s] * x[t] in place (in
+    the streams' dtype; weights [tokens][streams] or None for 1), then y = the rows of the streams as stored, over
+    their root mean square, times offset + weight ([dim], or [streams][dim]: a weight per stream); (y, streams), y in
+    out_dtype (the streams' by default)."""
+    _streams(streams, "streams")
+    _check(x, "x", streams.device)
+    tokens, count, width = streams.shape
+    if tuple(x.shape) != (tokens, width):
+        raise ValueError(f"x of shape {tuple(x.shape)} for streams of shape {tuple(streams.shape)}")
+    if weights is not None and (weights.device != streams.device or tuple(weights.shape) != (tokens, count)):
+        raise ValueError(f"weights of shape {tuple(weights.shape)}: one per token and stream, on {streams.device}")
+    groups, swg, grouped = _weight(weight, streams)
+    y = _result(streams, streams.shape, out_dtype, out)
+    if tokens == 0 or count == 0:
+        return y, streams
+    block, rows, warps = _config(width)
+    if block > WIDEST_BLOCK:
+        stream_add(streams, x, weights)
+        return rms_norm(streams, weight, eps, offset, out_dtype=y.dtype, out=y), streams
+    sh, sx, sy = (streams.stride(0), streams.stride(1)), (x.stride(0), 0), (y.stride(0), y.stride(1))
+    present = [streams, x, y] + ([weight] if weight is not None else [])
+    if not _aligned(present, [sh, sx, sy]):
+        kept, found = _padded(streams), _padded(y, copy=False)
+        if weight is not None and weight.data_ptr() % 16:
+            weight = weight.clone()
+        stream_add_norm(kept, _padded(x), weights, weight, eps, offset, y.dtype, found)
+        streams.copy_(kept)
+        y.copy_(found)
+        return y, streams
+    xw = weights if weights is not None else x
+    sw = (weights.stride(0), weights.stride(1)) if weights is not None else (0, 0)
+    with _on(streams):
+        _triton.rows_kernel[(_cdiv(tokens * count, rows),)](
+            x, *sx, streams, *sh, x, 0, 0, weight if weight is not None else x, groups, swg, y, *sy, x, x, 0, 1,
+            tokens * count, count, 1, width, 0, float(eps), float(offset), 1.0, xw, *sw,
+            NORM=1, HAS_RES=True, HAS_W=weight is not None, GROUPED=grouped, GATE=0, ROPE=0, TABLE=False,
+            IN_PLACE=False, HAS_XW=weights is not None, HB=rows, BD=block, num_warps=warps)
+    return y, streams
