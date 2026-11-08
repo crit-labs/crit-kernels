@@ -35,3 +35,6 @@ int64_t fp4_scratch_bytes(int64_t rows, int64_t k);
 void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::optional<torch::Tensor>& scales,
                const std::optional<torch::Tensor>& row_scale, int64_t weights, int64_t acts, double input_scale,
                bool blocked, int64_t splits, const std::optional<torch::Tensor>& scratch, torch::Tensor& out);
+// CTAs a multiprocessor of the current device holds of mm_rows' one-row kernel for `weights` and `acts` (the FP4
+// MMA's for acts 3, the decode tile's otherwise): plan()'s splits fill them.
+int64_t decode_ctas(int64_t weights, int64_t acts);

@@ -16,6 +16,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "mm_prompt(Tensor x, Tensor w, Tensor? scales, Tensor? row_scale, int weights, int acts, float input_scale, "
       "bool blocked, int splits, Tensor(c!)? scratch, Tensor! out) -> ()");
+  ops.def("decode_ctas(int weights, int acts) -> int");
 #if defined(CUDA_KERNEL)
   ops.impl("mm_rows", torch::kCUDA, &mm_rows);
   ops.impl("quantize_fp8_rows", torch::kCUDA, &quantize_fp8_rows);
@@ -24,6 +25,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp4_mma", torch::kCUDA, &fp4_mma);
   ops.impl("fp4_scratch_bytes", &fp4_scratch_bytes);
   ops.impl("mm_prompt", torch::kCUDA, &mm_prompt);
+  ops.impl("decode_ctas", &decode_ctas);
 #endif
 }
 

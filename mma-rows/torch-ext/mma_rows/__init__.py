@@ -30,7 +30,6 @@ STEP = 32         # K is a multiple of it
 VALUES = {name: int(ops.step_values(code)) for name, code in WEIGHTS.items()}   # K a step takes (the kernel's)
 MAX_WARPS, MAX_SPLITS = 4, 32
 WARPS = 4          # warps a CTA, each its own 16 x groups matrix rows
-CTAS_PER_SM = 3    # CTAs plan() asks of each multiprocessor, through splits of K where the rows are too few
 PROMPT_TOKENS = 64   # activation rows a CTA of mm_prompt takes
 
 __all__ = ["ACTS", "FP4_STEP", "MAX_ROWS", "PROMPT_TOKENS", "STEP", "VALUES", "WEIGHTS", "eligible", "fp4_mma",
@@ -45,22 +44,32 @@ def eligible(rows: int, columns: int) -> bool:
 
 def plan(rows: int, columns: int, weights: str, device=None, acts: str = "bf16"):
     """(groups, warps, splits) for a rows x columns matrix of `weights` (with `acts`) on `device`, from the shape and
-    the device's multiprocessor count alone: two 16-row groups a warp where the row tiles still give every
-    multiprocessor one (one on the FP4 MMA, acts nvfp4_mma), WARPS warps a CTA, and the splits of K that give each
-    multiprocessor CTAS_PER_SM CTAs (at most a step of K each: VALUES[weights], FP4_STEP on the FP4 MMA)."""
+    the device alone: one 16-row group a warp, WARPS warps a CTA, and the splits of K (of VALUES[weights] steps, of
+    FP4_STEP on the FP4 MMA, acts nvfp4_mma) whose CTAs fill the multiprocessors' resident CTAs of the one-row kernel
+    best (decode_ctas: that kernel's occupancy there, the decode tile's or the FP4 MMA's), the fewer splits on a tie;
+    splits of one step only while every CTA fits one wave. A decode call is a stream of weights: CTAs that overrun a
+    whole number of waves leave a short last wave the call waits for (a 44032 x 7168 NVFP4 matrix in 688 CTAs for 680
+    resident ran 10% slower than in seven splits), and waves of one-step splits leave a CTA nothing to keep in flight
+    (a 7168 x 7168 one in 14 splits, 12% slower than in 6)."""
     if weights not in WEIGHTS:
         raise ValueError(f"weights are {', '.join(WEIGHTS)}, not {weights!r}")
     if not eligible(rows, columns):
         raise ValueError(f"mm_rows takes K a multiple of {STEP}, not {columns}")
     if acts == "nvfp4_mma" and (weights != "nvfp4" or columns % FP4_STEP):
         raise ValueError(f"the FP4 MMA takes NVFP4 weights with K a multiple of {FP4_STEP}, not {weights} x {columns}")
-    sms = torch.cuda.get_device_properties(torch.device(device or "cuda")).multi_processor_count
     fp4 = acts == "nvfp4_mma"
-    groups = 2 if not fp4 and math.ceil(rows / (32 * WARPS)) >= sms else 1
-    tiles = row_tiles(rows, groups, WARPS)
+    device = torch.device(device or "cuda")
+    with torch.cuda.device(device):
+        resident = int(ops.decode_ctas(WEIGHTS[weights], ACTS["nvfp4_mma" if fp4 else "bf16"]))
+    slots = torch.cuda.get_device_properties(device).multi_processor_count * resident
+    tiles = row_tiles(rows, 1, WARPS)
     steps = columns // FP4_STEP if fp4 else math.ceil(columns / VALUES[weights])
-    splits = max(1, min(MAX_SPLITS, steps, math.ceil(CTAS_PER_SM * sms / tiles)))
-    return groups, WARPS, splits
+
+    def filled(splits):   # the share of the resident CTAs a call's waves keep busy
+        waves = tiles * splits / slots
+        return waves if waves <= 1 else waves / math.ceil(waves)
+    choices = [s for s in range(1, min(MAX_SPLITS, steps) + 1) if steps // s >= 2 or tiles * s <= slots] or [1]
+    return 1, WARPS, max(choices, key=lambda s: (filled(s), -s))
 
 
 def row_tiles(rows: int, groups: int, warps: int) -> int:

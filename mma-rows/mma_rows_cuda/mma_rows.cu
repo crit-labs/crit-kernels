@@ -257,7 +257,25 @@ cudaError_t by_tile(const Problem& p, cudaStream_t stream) {
   return launch<WF, ACT, 1, 8>(p, stream);
 }
 
+template <int WF>
+int resident_ctas() {
+  int n = 0;
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, mma_kernel<WF, kActBf16, 1, 1>, kMaxWarps * 32, 0) ==
+                 cudaSuccess ? n : 0;
+}
+
 }  // namespace
+
+int decode_ctas(int weights, int acts) {
+  if (acts == kActNvfp4Mma) return weights == kNvfp4 ? fp4_ctas() : 0;
+  switch (weights) {
+    case kNvfp4: return resident_ctas<kNvfp4>();
+    case kFp8: return resident_ctas<kFp8>();
+    case kMxfp8: return resident_ctas<kMxfp8>();
+    case kBf16: return resident_ctas<kBf16>();
+    default: return 0;
+  }
+}
 
 cudaError_t prepass(Problem& p, cudaStream_t stream) {
   if (p.acts == kActBf16) return cudaSuccess;

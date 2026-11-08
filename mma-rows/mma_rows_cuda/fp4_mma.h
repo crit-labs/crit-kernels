@@ -13,6 +13,9 @@ constexpr int kFp4Hoist = 2;     // the FP4 MMA's steps of weights a warp loads 
 
 // Whether this build multiplies kActNvfp4Mma on the current device (the code for its architecture has the MMA).
 bool fp4_mma(cudaStream_t stream);
+// CTAs of kMaxWarps warps a multiprocessor of the current device holds of the one-row FP4 MMA (plan()'s slots for
+// acts nvfp4_mma, through decode_ctas); 0 on an error.
+int fp4_ctas();
 // Scratch bytes kActNvfp4Mma's activations take: codes [M][K / 2], then blocked scales of ceil(M / 128) * 128 rows.
 inline std::size_t fp4_scratch_bytes(int M, int K) {
   return ((std::size_t)M * K / 2 + 15) / 16 * 16 + (std::size_t)(M + 127) / 128 * 128 * ((K / 16 + 3) / 4 * 4);

@@ -94,6 +94,10 @@ struct Problem {
 };
 
 cudaError_t enqueue(const Problem& p, cudaStream_t stream);
+// CTAs of kMaxWarps warps a multiprocessor of the current device holds of the one-row kernel for `weights` and
+// `acts` (its occupancy: registers and the launch bounds; the FP4 MMA's for kActNvfp4Mma, the decode tile's
+// otherwise), which plan() fills with splits of K; 0 on an error.
+int decode_ctas(int weights, int acts);
 // The quantized activations' pre-pass of a call (acts other than kActBf16): their values (BF16, exact) and FP8 row
 // scales into p.scratch, then p.x, p.ldx and p.act_scale point there. Nothing for kActBf16.
 cudaError_t prepass(Problem& p, cudaStream_t stream);

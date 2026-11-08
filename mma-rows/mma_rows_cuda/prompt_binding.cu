@@ -103,3 +103,11 @@ void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::option
   TORCH_CHECK(e == cudaSuccess, "mm_prompt: ", cudaGetErrorString(e));
 }
 
+int64_t decode_ctas(int64_t weights, int64_t acts) {
+  TORCH_CHECK(weights >= mr::kNvfp4 && weights <= mr::kBf16, "decode_ctas: weights 0 NVFP4, 1 FP8, 2 MXFP8, 3 BF16");
+  TORCH_CHECK(acts >= mr::kActBf16 && acts <= mr::kActNvfp4Mma, "decode_ctas: activations 0 to 3");
+  const int n = mr::decode_ctas(static_cast<int>(weights), static_cast<int>(acts));
+  TORCH_CHECK(n > 0, "decode_ctas: the kernel's occupancy is not known on this device (or acts 3 with weights "
+                     "other than NVFP4)");
+  return n;
+}
