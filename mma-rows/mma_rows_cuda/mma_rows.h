@@ -94,6 +94,13 @@ struct Problem {
 };
 
 cudaError_t enqueue(const Problem& p, cudaStream_t stream);
+// CTAs of kMaxWarps warps a multiprocessor of the current device holds of the one-row kernel for `weights` and
+// `acts` (its occupancy: registers and the launch bounds; the FP4 MMA's for kActNvfp4Mma, the decode tile's
+// otherwise), which plan() fills with splits of K; 0 on an error.
+int decode_ctas(int weights, int acts);
+// The quantized activations' pre-pass of a call (acts other than kActBf16): their values (BF16, exact) and FP8 row
+// scales into p.scratch, then p.x, p.ldx and p.act_scale point there. Nothing for kActBf16.
+cudaError_t prepass(Problem& p, cudaStream_t stream);
 
 // The activations' quantizers alone, for a provider's GEMM on the same activations (prompt rows):
 // FP8 rows: q [M][K] E4M3 bytes, scale [M] FP32, as kActFp8Rows. NVFP4: codes [M][K / 2] (two per byte, low nibble
@@ -103,5 +110,12 @@ cudaError_t enqueue_quantize_fp8_rows(const void* x, int64_t ldx, int M, int K, 
                                       float* scale, cudaStream_t stream);
 cudaError_t enqueue_quantize_nvfp4(const void* x, int64_t ldx, int M, int K, float input_scale, float input_rcp,
                                    std::uint8_t* codes, std::uint8_t* blocked_scales, cudaStream_t stream);
+
+// The prompt tile (prompt_tile.cu): out [M][N] for any number of activation rows M >= 1, every element with the bits
+// enqueue() gives it at any row count (the same Problem: weights, scales, acts, splits; `groups`, `warps`, `partial`
+// and `counters` are not read), each decoded weight reused for kPromptTokens rows a CTA. Quantized activations take
+// scratch_bytes(M, K) of scratch, as enqueue()'s pre-pass does.
+constexpr int kPromptTokens = 64;   // activation rows a prompt-tile CTA takes
+cudaError_t enqueue_prompt(const Problem& p, cudaStream_t stream);
 
 }  // namespace crit::kernels::mma_rows

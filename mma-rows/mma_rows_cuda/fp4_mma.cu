@@ -233,4 +233,9 @@ bool fp4_mma(cudaStream_t stream) {
   return found[device] == 1;
 }
 
+int fp4_ctas() {
+  int n = 0;
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fp4_kernel<1>, kMaxWarps * 32, 0) == cudaSuccess ? n : 0;
+}
+
 }  // namespace crit::kernels::mma_rows
