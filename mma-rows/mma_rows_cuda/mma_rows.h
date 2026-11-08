@@ -53,7 +53,10 @@ constexpr int kStep = 32;        // K is a multiple of it (a lane's sub-step)
 constexpr int kLaneBytes = CRIT_MMA_LANE_BYTES;   // a matrix row's contiguous bytes a lane reads a step
 
 enum Weights : int { kNvfp4 = 0, kFp8 = 1, kMxfp8 = 2, kBf16 = 3 };
-enum Acts : int { kActBf16 = 0, kActFp8Rows = 1, kActNvfp4 = 2 };
+// kActNvfp4Mma: the activations quantized to NVFP4 as kActNvfp4, multiplied on the block-scaled FP4 MMA (E2M1 x E2M1
+// with each operand's UE4M3 scale per 16 along K) instead of as BF16 values: NVFP4 weights with blocked scales, K a
+// multiple of 128, devices with the MMA (fp4_mma()).
+enum Acts : int { kActBf16 = 0, kActFp8Rows = 1, kActNvfp4 = 2, kActNvfp4Mma = 3 };
 enum Out : int { kOutF32 = 0, kOutBf16 = 1, kOutF16 = 2 };
 
 // K values a step covers (4 x kLaneBytes of a matrix row): part of the sums' order.

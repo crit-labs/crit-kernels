@@ -26,4 +26,6 @@ src = [
   "mma_rows_cuda/binding.cu",
   "mma_rows_cuda/mma_rows.cu",
   "mma_rows_cuda/mma_rows.h",
+  "mma_rows_cuda/fp4_mma.cu",
+  "mma_rows_cuda/fp4_mma.h",
 ]

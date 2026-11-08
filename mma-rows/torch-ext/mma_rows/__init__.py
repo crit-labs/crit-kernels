@@ -23,7 +23,8 @@ import torch
 from ._ops import ops
 
 WEIGHTS = {"nvfp4": 0, "fp8": 1, "mxfp8": 2, "bf16": 3}
-ACTS = {"bf16": 0, "fp8_rows": 1, "nvfp4": 2}
+ACTS = {"bf16": 0, "fp8_rows": 1, "nvfp4": 2, "nvfp4_mma": 3}
+FP4_STEP = 128     # K the FP4 MMA's step covers (its splits are of these steps)
 MAX_ROWS = 64     # activation rows a call takes
 STEP = 32         # K is a multiple of it
 VALUES = {name: int(ops.step_values(code)) for name, code in WEIGHTS.items()}   # K a step takes (the kernel's)
@@ -31,8 +32,8 @@ MAX_WARPS, MAX_SPLITS = 4, 32
 WARPS = 4          # warps a CTA, each its own 16 x groups matrix rows
 CTAS_PER_SM = 3    # CTAs plan() asks of each multiprocessor, through splits of K where the rows are too few
 
-__all__ = ["ACTS", "MAX_ROWS", "STEP", "VALUES", "WEIGHTS", "eligible", "mm_rows", "partial_elements", "plan",
-           "quantize_fp8_rows", "quantize_nvfp4", "row_tiles", "scratch_bytes"]
+__all__ = ["ACTS", "FP4_STEP", "MAX_ROWS", "STEP", "VALUES", "WEIGHTS", "eligible", "fp4_mma", "mm_rows",
+           "partial_elements", "plan", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles", "scratch_bytes"]
 
 
 def eligible(rows: int, columns: int) -> bool:
@@ -40,18 +41,22 @@ def eligible(rows: int, columns: int) -> bool:
     return rows >= 1 and columns >= STEP and columns % STEP == 0
 
 
-def plan(rows: int, columns: int, weights: str, device=None):
-    """(groups, warps, splits) for a rows x columns matrix of `weights` on `device`, from the shape and the device's
-    multiprocessor count alone: two 16-row groups a warp where the row tiles still give every multiprocessor one,
-    WARPS warps a CTA, and the splits of K that give each multiprocessor CTAS_PER_SM CTAs (at most a step of K each)."""
+def plan(rows: int, columns: int, weights: str, device=None, acts: str = "bf16"):
+    """(groups, warps, splits) for a rows x columns matrix of `weights` (with `acts`) on `device`, from the shape and
+    the device's multiprocessor count alone: two 16-row groups a warp where the row tiles still give every
+    multiprocessor one (one on the FP4 MMA, acts nvfp4_mma), WARPS warps a CTA, and the splits of K that give each
+    multiprocessor CTAS_PER_SM CTAs (at most a step of K each: VALUES[weights], FP4_STEP on the FP4 MMA)."""
     if weights not in WEIGHTS:
         raise ValueError(f"weights are {', '.join(WEIGHTS)}, not {weights!r}")
     if not eligible(rows, columns):
         raise ValueError(f"mm_rows takes K a multiple of {STEP}, not {columns}")
+    if acts == "nvfp4_mma" and (weights != "nvfp4" or columns % FP4_STEP):
+        raise ValueError(f"the FP4 MMA takes NVFP4 weights with K a multiple of {FP4_STEP}, not {weights} x {columns}")
     sms = torch.cuda.get_device_properties(torch.device(device or "cuda")).multi_processor_count
-    groups = 2 if math.ceil(rows / (32 * WARPS)) >= sms else 1
+    fp4 = acts == "nvfp4_mma"
+    groups = 2 if not fp4 and math.ceil(rows / (32 * WARPS)) >= sms else 1
     tiles = row_tiles(rows, groups, WARPS)
-    steps = math.ceil(columns / VALUES[weights])
+    steps = columns // FP4_STEP if fp4 else math.ceil(columns / VALUES[weights])
     splits = max(1, min(MAX_SPLITS, steps, math.ceil(CTAS_PER_SM * sms / tiles)))
     return groups, WARPS, splits
 
@@ -60,9 +65,19 @@ def row_tiles(rows: int, groups: int, warps: int) -> int:
     return math.ceil(rows / (16 * groups * warps))
 
 
-def scratch_bytes(tokens: int, columns: int) -> int:
-    """Bytes of scratch quantized activations take for `tokens` rows of `columns`."""
+def scratch_bytes(tokens: int, columns: int, acts: str = "fp8_rows") -> int:
+    """Bytes of scratch quantized activations take for `tokens` rows of `columns` (acts nvfp4_mma: their codes and
+    blocked scales, rows padded to 128)."""
+    if acts == "nvfp4_mma":
+        return int(ops.fp4_scratch_bytes(tokens, columns))
     return (tokens * columns * 2 + 15) // 16 * 16 + tokens * 4
+
+
+def fp4_mma(device=None) -> bool:
+    """Whether acts nvfp4_mma (the activations in NVFP4 on the block-scaled FP4 MMA) runs on `device` with this build:
+    the sm_120 family (sm_120a, sm_121a code). The first call per device runs a probe kernel and waits for it."""
+    device = torch.device(device or "cuda")
+    return device.type == "cuda" and bool(ops.fp4_mma(torch.empty(0, device=device)))
 
 
 def partial_elements(tokens: int, rows: int, splits: int) -> int:
@@ -75,8 +90,10 @@ def mm_rows(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str, s
     """out [M][N] (FP32, BF16 or FP16) = x [M][K] (M 1..64, BF16, rows on 16-byte boundaries) times the matrix w.
     acts: bf16 (x as it is), fp8_rows (FP8 weights: each row in E4M3 by its own scale amax * fp32(1 / 448), at least
     1e-12; out = sum * row_scale * the row's scale), nvfp4 (NVFP4 weights: each 16-value block in E2M1 under
-    input_scale, the block scale e4m3(min(amax * fp32(1 / 6) * input_scale, 448)); out = sum * row_scale *
-    fp32(1 / input_scale)). groups, warps, splits: plan()'s."""
+    input_scale, the block scale e4m3(min(amax * fp32(1 / 6) * input_scale, 448)), multiplied as BF16 values; out =
+    sum * row_scale * fp32(1 / input_scale)), nvfp4_mma (the same NVFP4 activations multiplied as codes with their
+    block scales on the FP4 MMA, NVFP4 weights with blocked scales, K a multiple of FP4_STEP, where fp4_mma(); its own
+    order). groups, warps, splits: plan()'s (with the acts)."""
     ops.mm_rows(x, w, scales, row_scale, WEIGHTS[weights], ACTS[acts], float(input_scale), blocked, groups, warps,
                 splits, scratch, partial, counters, out)
     return out

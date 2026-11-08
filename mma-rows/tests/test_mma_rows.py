@@ -250,3 +250,85 @@ def test_plan_comes_from_the_shape_and_the_device():
         assert tiles * splits >= min(sms, tiles * math.ceil(k / mr.VALUES[weights]), tiles * 32)
     with pytest.raises(ValueError, match="multiple of 32"):
         mr.plan(100, 200, "nvfp4")
+
+
+FP4 = pytest.mark.skipif(not mr.fp4_mma(dev), reason="no FP4 MMA on this device or build (the sm_120 family)")
+
+
+def fp4_call(x, stored, splits=1, warps=4, out=None, dtype=torch.float32, bufs=None):
+    w, scales, row_scale = stored
+    m, n, k = x.shape[0], w.shape[0], x.shape[1]
+    out = torch.empty(m, n, dtype=dtype, device=dev) if out is None else out
+    if bufs is None:
+        scratch = torch.empty(mr.scratch_bytes(m, k, "nvfp4_mma"), dtype=torch.uint8, device=dev)
+        partial = torch.empty(max(1, mr.partial_elements(m, n, splits)), dtype=torch.float32, device=dev)
+        counters = torch.zeros(mr.row_tiles(n, 1, warps), dtype=torch.int32, device=dev)
+        bufs = scratch, partial, counters
+    return mr.mm_rows(x, w, out, "nvfp4", scales, row_scale, "nvfp4_mma", INPUT_SCALE, True, 1, warps, splits, *bufs)
+
+
+@FP4
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("shape", [(96, 256), (1000, 5120), (130, 2048), (300, 1152)])
+def test_the_fp4_mma_multiplies_the_quantized_activations_by_the_stored_values(shape):
+    n, k = shape
+    stored, values = matrix("nvfp4", n, k, True)
+    steps = k // mr.FP4_STEP
+    for rows in (1, 7, 16, 33, 64):
+        x = activations(rows, k)
+        q = nvfp4_values(x, INPUT_SCALE).double()
+        exact = q @ values.t().to(dev) / INPUT_SCALE
+        magnitude = q.abs() @ values.abs().t().to(dev) / INPUT_SCALE
+        for splits in sorted({1, min(3, steps), min(32, steps)}):
+            found = fp4_call(x, stored, splits=splits).double()
+            assert bool(((found - exact).abs() <= magnitude * 2e-5 + 1e-30).all()), (rows, splits)
+        bf16 = call(x, stored, "nvfp4", "nvfp4", True).double()   # the same activations as BF16 values
+        assert float((found - bf16).abs().max() / bf16.abs().max()) < 1e-5
+
+
+@FP4
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("splits", [1, 3])
+def test_on_the_fp4_mma_a_row_keeps_its_bits_alone_and_among_up_to_64(splits):
+    n, k = 1000, 2048
+    stored, _ = matrix("nvfp4", n, k, True)
+    x = activations(64, k)
+    alone = torch.cat([fp4_call(x[r:r + 1].clone(), stored, splits=splits) for r in range(64)])
+    for rows in list(range(2, 18)) + [23, 31, 32, 33, 47, 64]:
+        for warps in (4, 2, 1):
+            assert torch.equal(fp4_call(x[:rows], stored, splits=splits, warps=warps), alone[:rows]), (rows, warps)
+        for first in (1, 64 - rows):
+            assert torch.equal(fp4_call(x[first:first + rows].clone(), stored, splits=splits),
+                               alone[first:first + rows]), (rows, first)
+
+
+@FP4
+def test_the_fp4_mma_captures_with_its_pre_pass_and_refuses_what_it_cannot_read():
+    n, k = 512, 4096
+    stored, _ = matrix("nvfp4", n, k, True)
+    x = activations(9, k)
+    scratch = torch.empty(mr.scratch_bytes(9, k, "nvfp4_mma"), dtype=torch.uint8, device=dev)
+    partial = torch.empty(mr.partial_elements(9, n, 4), dtype=torch.float32, device=dev)
+    counters = torch.zeros(mr.row_tiles(n, 1, 4), dtype=torch.int32, device=dev)
+    out = torch.empty(9, n, dtype=torch.bfloat16, device=dev)
+    fp4_call(x, stored, splits=4, out=out, bufs=(scratch, partial, counters))
+    expected = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fp4_call(x, stored, splits=4, out=out, bufs=(scratch, partial, counters))
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected)
+    assert not counters.any()
+    w, scales, row_scale = stored
+    with pytest.raises(RuntimeError):   # row-major scales
+        mr.mm_rows(x, w, out, "nvfp4", scales, row_scale, "nvfp4_mma", INPUT_SCALE, False, 1, 4, 1, scratch, partial,
+                   counters)
+    small = matrix("nvfp4", 64, 96, True)[0]
+    with pytest.raises((RuntimeError, ValueError)):   # K no multiple of 128
+        fp4_call(activations(4, 96), small)
+    with pytest.raises(ValueError):
+        mr.plan(64, 96, "nvfp4", dev, acts="nvfp4_mma")
+    assert mr.plan(34816, 5120, "nvfp4", dev, acts="nvfp4_mma")[0] == 1

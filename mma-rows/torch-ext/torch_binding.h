@@ -24,3 +24,8 @@ void quantize_fp8_rows(const torch::Tensor& x, torch::Tensor& q, torch::Tensor& 
 void quantize_nvfp4(const torch::Tensor& x, double input_scale, torch::Tensor& codes, torch::Tensor& scales);
 // K values one step of mm_rows covers for `weights` (the plan's splits are of steps).
 int64_t step_values(int64_t weights);
+// Whether this build multiplies activations 3 (NVFP4 on the FP4 MMA) on like's device; the first call per device runs
+// a one-thread probe kernel and waits for it (call it at load, not inside a capture).
+bool fp4_mma(const torch::Tensor& like);
+// Scratch bytes activations 3 take for `rows` rows of K.
+int64_t fp4_scratch_bytes(int64_t rows, int64_t k);

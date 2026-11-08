@@ -1,5 +1,6 @@
 // Projections of 1 to 64 rows on tensor cores, one fixed tile, and the activations' quantizers (mma_rows.h).
 #include "mma_rows.h"
+#include "fp4_mma.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -590,6 +591,7 @@ cudaError_t enqueue(const Problem& given, cudaStream_t stream) {
       (p.splits > 1 && (!p.partial || !p.counters)))
     return cudaErrorInvalidValue;
   // A row tile's rows (a quad of a tile's warps reads its 16) are rows of one tile: the counters are a tile's.
+  if (p.acts == kActNvfp4Mma) return enqueue_fp4(p, stream);   // fp4_mma.cu
   if (p.acts != kActBf16) {
     if (!p.scratch) return cudaErrorInvalidValue;
     __nv_bfloat16* values = reinterpret_cast<__nv_bfloat16*>(p.scratch);
