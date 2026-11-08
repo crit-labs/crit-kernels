@@ -1,22 +1,43 @@
 #pragma once
 
+#include <optional>
+#include <vector>
+
 #include <torch/torch.h>
 
-// ids [tokens, top_k] int32; the workspace tensors int32: counts [experts], offsets and tile_offsets [experts + 1],
-// row_route and route_row [tokens * top_k].
-void route_sort(const torch::Tensor& ids, int64_t experts, torch::Tensor& counts, torch::Tensor& offsets,
-                torch::Tensor& tile_offsets, torch::Tensor& row_route, torch::Tensor& route_row);
-// x [tokens, hidden] fp16 -> xp [tokens * top_k, hidden] fp16 in expert order.
-void gather(const torch::Tensor& x, const torch::Tensor& ids, int64_t experts, const torch::Tensor& counts,
-            const torch::Tensor& offsets, const torch::Tensor& tile_offsets, const torch::Tensor& row_route,
-            const torch::Tensor& route_row, torch::Tensor& xp);
-// format 0 bf16, 1 fp8_e4m3_row, 2 nvfp4, 3 mxfp4; table: one Matrix per expert (uint8); xp [rows, in] -> yp [rows, out].
-void grouped_projection(int64_t format, const torch::Tensor& table, const torch::Tensor& xp, int64_t out_dim,
-                        const torch::Tensor& ids, int64_t experts, const torch::Tensor& counts, const torch::Tensor& offsets,
-                        const torch::Tensor& tile_offsets, const torch::Tensor& row_route, const torch::Tensor& route_row,
-                        torch::Tensor& yp);
-void swiglu(const torch::Tensor& gate_up, torch::Tensor& out);
-// yp [rows, hidden] fp16 -> out [tokens, hidden] fp32, each token's routes in order with their weights.
-void combine(const torch::Tensor& yp, const torch::Tensor& ids, const torch::Tensor& weights, int64_t experts,
-             const torch::Tensor& counts, const torch::Tensor& offsets, const torch::Tensor& tile_offsets,
-             const torch::Tensor& row_route, const torch::Tensor& route_row, torch::Tensor& out);
+// ids [routes] (int64 or int32), slots [experts] int32 or empty; the items int32: item_slot [capacity], item_routes
+// [capacity][width] (width 8 or 32), item_count [1]. plan takes up to 1024 routes; items the larger ones from a stable
+// sort (order int64 [routes]; counts, starts and item_end int32 [experts]).
+void plan(const torch::Tensor& ids, const std::optional<torch::Tensor>& slots, int64_t experts, torch::Tensor& item_slot,
+          torch::Tensor& item_routes, torch::Tensor& item_count);
+void items(const torch::Tensor& order, const torch::Tensor& counts, const torch::Tensor& starts,
+           const torch::Tensor& item_end, const std::optional<torch::Tensor>& slots, int64_t experts,
+           torch::Tensor& item_slot, torch::Tensor& item_routes, torch::Tensor& item_count);
+// x [tokens][hidden] BF16, store uint8 [slots][bundle bytes] -> h [routes][inter] BF16.
+void gate_up(const torch::Tensor& x, int64_t top, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+             bool a4, const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+             torch::Tensor& h);
+// h [routes][inter] BF16 -> y [routes][hidden] FP32, unweighted.
+void down(const torch::Tensor& h, const torch::Tensor& store, c10::ArrayRef<int64_t> layout, bool a4,
+          const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+          torch::Tensor& y);
+// y [routes][hidden] FP32, ids and weights [tokens][top] -> out [tokens][hidden] FP32 in route order.
+void combine(const torch::Tensor& y, const torch::Tensor& ids, const torch::Tensor& weights,
+             const std::optional<torch::Tensor>& slots, int64_t experts, bool skip_negative, torch::Tensor& out);
+// x [rows][cols] FP32 -> values int8 (2 * e2m1), scales FP32 [rows][cols / 16]: crit's declared NVFP4 quantizer.
+void quantize_e2m1x2(const torch::Tensor& x, double global, torch::Tensor& values, torch::Tensor& scales);
+// W4A4 gate/up operands of the planned routes for decode items: out [routes][hidden] BF16.
+void a4_inputs(const torch::Tensor& x, int64_t top, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+               const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+               torch::Tensor& out);
+// The declared arithmetic (nvfp4 W4A4, int4 W4A8): the planned routes' inputs quantized per their experts, an
+// expert's declared rows (gate_up [routes][2 * inter] or down [routes][hidden] FP32), the declared intermediate.
+void declared_inputs(const torch::Tensor& x, int64_t top, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+                     const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+                     torch::Tensor& values, torch::Tensor& scales);
+void declared_rows(const torch::Tensor& values, const torch::Tensor& scales, const torch::Tensor& store,
+                   c10::ArrayRef<int64_t> layout, bool gate_up, const torch::Tensor& item_slot,
+                   const torch::Tensor& item_routes, const torch::Tensor& item_count, torch::Tensor& out);
+void declared_intermediate(const torch::Tensor& gate_up, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+                           const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+                           const torch::Tensor& item_count, torch::Tensor& values, torch::Tensor& scales);
