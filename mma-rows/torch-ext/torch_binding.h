@@ -29,3 +29,9 @@ int64_t step_values(int64_t weights);
 bool fp4_mma(const torch::Tensor& like);
 // Scratch bytes activations 3 take for `rows` rows of K.
 int64_t fp4_scratch_bytes(int64_t rows, int64_t k);
+// out [M][N] for any number of rows M >= 1, each element with mm_rows' bits for the same matrix, activations and
+// splits (the prompt tile: each decoded weight reused for 64 rows a CTA). Quantized activations take scratch (M * K * 2
+// + M * 4 bytes, rounded to 16); no partial sums or counters.
+void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::optional<torch::Tensor>& scales,
+               const std::optional<torch::Tensor>& row_scale, int64_t weights, int64_t acts, double input_scale,
+               bool blocked, int64_t splits, const std::optional<torch::Tensor>& scratch, torch::Tensor& out);

@@ -31,9 +31,11 @@ VALUES = {name: int(ops.step_values(code)) for name, code in WEIGHTS.items()}   
 MAX_WARPS, MAX_SPLITS = 4, 32
 WARPS = 4          # warps a CTA, each its own 16 x groups matrix rows
 CTAS_PER_SM = 3    # CTAs plan() asks of each multiprocessor, through splits of K where the rows are too few
+PROMPT_TOKENS = 64   # activation rows a CTA of mm_prompt takes
 
-__all__ = ["ACTS", "FP4_STEP", "MAX_ROWS", "STEP", "VALUES", "WEIGHTS", "eligible", "fp4_mma", "mm_rows",
-           "partial_elements", "plan", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles", "scratch_bytes"]
+__all__ = ["ACTS", "FP4_STEP", "MAX_ROWS", "PROMPT_TOKENS", "STEP", "VALUES", "WEIGHTS", "eligible", "fp4_mma",
+           "mm_prompt", "mm_rows", "partial_elements", "plan", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles",
+           "scratch_bytes"]
 
 
 def eligible(rows: int, columns: int) -> bool:
@@ -96,6 +98,17 @@ def mm_rows(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str, s
     order). groups, warps, splits: plan()'s (with the acts)."""
     ops.mm_rows(x, w, scales, row_scale, WEIGHTS[weights], ACTS[acts], float(input_scale), blocked, groups, warps,
                 splits, scratch, partial, counters, out)
+    return out
+
+
+def mm_prompt(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str, scales=None, row_scale=None,
+              acts: str = "bf16", input_scale: float = 1.0, blocked: bool = False, splits: int = 1, scratch=None):
+    """out [M][N] = x [M][K] times the matrix w for any number of rows M >= 1 (the prompt tile), every element with
+    the bits mm_rows gives it for the same matrix, acts and splits (plan()'s, the matrix's): a prompt row equals the
+    same row decoded alone or batched, so a prompt's tokens score as they are served. Each decoded weight serves
+    PROMPT_TOKENS rows a CTA (a GEMM's reuse); quantized activations take scratch_bytes(M, K) of scratch."""
+    ops.mm_prompt(x, w, scales, row_scale, WEIGHTS[weights], ACTS[acts], float(input_scale), blocked, splits, scratch,
+                  out)
     return out
 
 
