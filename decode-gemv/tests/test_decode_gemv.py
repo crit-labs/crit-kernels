@@ -1,6 +1,7 @@
 """decode-gemv against an FP64 reference of the stored values: the CUDA and the Triton GEMV within FP32 accumulation,
 each row's bits the same alone and beside up to 7 others, both E2M1 decodes the same bits, the decoders one FP32
-product rounded once, and the CUDA GEMVs captured in a CUDA graph."""
+product rounded once, and the CUDA GEMVs captured in a CUDA graph; the FP8 dot GEMV within FP32 accumulation,
+its rows the same bits at every row count 1 to 16 and at offsets, with and without parts of K, and captured."""
 import os
 import shutil
 import sys
@@ -316,3 +317,61 @@ def test_tensors_on_another_device_or_misaligned_are_refused():
     fc, fs = fp8_matrix(96, 256, False)
     with pytest.raises(RuntimeError):
         nr.gemv_fp8(x, fc, fs.cpu(), out)
+
+
+def fp8_dot_matrix(n, k, seed=6):
+    g = torch.Generator().manual_seed(seed)
+    codes = torch.randint(0, 0x7E, (n, k), generator=g, dtype=torch.uint8)
+    codes |= torch.randint(0, 2, (n, k), generator=g, dtype=torch.uint8) << 7
+    row_scale = torch.rand(n, generator=g) / 64 + 1e-3
+    return codes.to(dev).view(torch.float8_e4m3fn), row_scale.to(dev)
+
+
+@pytest.mark.parametrize("shape,plan", [((300, 1024), None), ((512, 4096), (32, 256, 4, 4)), ((96, 640), None),
+                                        ((2048, 5120), (64, 512, 8, 2))])
+def test_the_fp8_dot_gemv_multiplies_by_the_stored_values_and_keeps_rows(shape, plan):
+    n, k = shape
+    plan = plan or nr.fp8_dot_tile(n, k, torch.cuda.get_device_properties(dev).multi_processor_count)
+    w, s = fp8_dot_matrix(n, k)
+    partial = torch.empty(nr.dot_partial_elements(16, n, plan[3]) or 1, dtype=torch.float32, device=dev)
+    x = activations(16, k)
+    exact = x.double() @ (w.float().double() * s.double()[:, None]).t()
+    for out_dtype in (torch.float32, torch.bfloat16):
+        whole = nr.gemv_fp8_dot(x, w, s, torch.empty(16, n, dtype=out_dtype, device=dev), plan, partial)
+        bound = 2e-5 if out_dtype == torch.float32 else 1e-2
+        assert float((whole.double() - exact).abs().max() / exact.abs().max()) < bound
+        for m in range(1, 16):
+            for first in (0, 16 - m):
+                part = nr.gemv_fp8_dot(x[first:first + m].clone(), w, s, torch.empty(m, n, dtype=out_dtype, device=dev),
+                                       plan, partial)
+                assert torch.equal(part, whole[first:first + m]), (m, first, out_dtype)
+
+
+def test_the_fp8_dot_gemv_tiles_follow_the_shape_and_refuse_what_they_cannot_read():
+    for n, k in ((16384, 5120), (5120, 6144), (14336, 5120), (248320, 5120), (2560, 640), (1280, 2560)):
+        bn, bk, warps, split = nr.fp8_dot_tile(n, k, 170)
+        assert bn in (32, 64) and k % (bk * split) == 0 and warps in (4, 8)
+    with pytest.raises(ValueError):
+        nr.fp8_dot_tile(512, 1000, 170)
+    w, s = fp8_dot_matrix(256, 1024)
+    with pytest.raises(ValueError):
+        nr.gemv_fp8_dot(activations(17, 1024), w, s, torch.empty(17, 256, device=dev), (32, 256, 4, 1))
+    with pytest.raises(ValueError):
+        nr.gemv_fp8_dot(activations(4, 1024), w, s, torch.empty(4, 256, device=dev), (32, 256, 4, 2))
+
+
+def test_the_fp8_dot_gemv_captures_in_a_cuda_graph():
+    w, s = fp8_dot_matrix(512, 4096)
+    plan = (32, 256, 4, 4)
+    partial = torch.empty(nr.dot_partial_elements(16, 512, 4), dtype=torch.float32, device=dev)
+    x = activations(9, 4096)
+    out = torch.empty(9, 512, dtype=torch.float32, device=dev)
+    nr.gemv_fp8_dot(x, w, s, out, plan, partial)
+    expected = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        nr.gemv_fp8_dot(x, w, s, out, plan, partial)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
